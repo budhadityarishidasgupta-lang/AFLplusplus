@@ -13,8 +13,17 @@ All paths in `openclaw.json` are relative to `openclaw_project/`:
 ```text
 openclaw_fuzzer_config/
 ├── README.md
+├── openclaw_home/                       # materialize as ~/.openclaw
+│   └── skills/
+│       ├── recon-analyzer/
+│       │   ├── SKILL.md
+│       │   ├── memory/                  # append-only reviewed path rules
+│       │   └── plugins/drafts/          # declarative parser drafts
+│       └── evolutionary-fuzzer/
+│           └── SKILL.md
 └── openclaw_project/                    # OpenClaw daemon project root
     ├── openclaw.json                    # engines, agents, tools, routing, sandbox
+    ├── fuzzer_flow.lobster              # typed, approval-gated DAG
     ├── agents/
     │   ├── recon_planner/               # workspace: recon_planner_01
     │   │   ├── SOUL.md                  # analytical defensive persona
@@ -68,3 +77,35 @@ Local operator
 Invalid paths, stale cycle identifiers, disabled safety flags, or destinations
 other than the loopback allowlist must transition the ledger to `BLOCKED` and
 must not reach the Bash-capable worker.
+
+## Skill placement
+
+The repository stores installable skill templates under `openclaw_home/skills/`
+so their final mapping is explicit:
+
+```text
+openclaw_fuzzer_config/openclaw_home/skills/recon-analyzer/SKILL.md
+  → ~/.openclaw/skills/recon-analyzer/SKILL.md
+
+openclaw_fuzzer_config/openclaw_home/skills/evolutionary-fuzzer/SKILL.md
+  → ~/.openclaw/skills/evolutionary-fuzzer/SKILL.md
+```
+
+The recon skill's `memory/` and `plugins/drafts/` directories remain local to
+that skill. Parser drafts require a later-cycle human approval and contain
+specifications/pseudocode only; the skill cannot generate and immediately run
+new executable capability.
+
+## Lobster flow
+
+`fuzzer_flow.lobster` declares typed target arguments and JSON state, invokes
+recon, pauses at an approval node that returns a `resumeToken`, invokes the
+developer, runs a bounded assessment sub-workflow while fitness is below 100,
+and routes threshold success to defensive finding and patch documentation. A
+separate terminal ledger step records budget exhaustion, so every approved run
+terminates deterministically.
+
+Lobster schemas can vary between OpenClaw releases. The file is a complete
+declarative object specification; validate its `approval`, `subworkflow`, and
+expression keys with the schema shipped by the exact daemon release before
+materializing it in an operational workspace.

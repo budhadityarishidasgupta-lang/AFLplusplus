@@ -75,6 +75,7 @@
     ]
   },
   "orchestration": {
+    "workflow": "./fuzzer_flow.lobster",
     "sharedDirectory": "./shared_data",
     "artifacts": {
       "blueprint": "./shared_data/blueprint.json",
@@ -98,6 +99,14 @@
     "networkPolicy": "loopback-allowlist",
     "targetsDirectory": "./sandbox/targets",
     "corpusDirectory": "./sandbox/corpus",
-    "runtimeDirectory": "./sandbox/runtime"
+    "runtimeDirectory": "./sandbox/runtime",
+    "fuzzer_metrics_port": 8080
+  },
+  "skills": {
+    "searchPaths": ["../openclaw_home/skills"],
+    "assignments": {
+      "recon_planner_01": ["recon-analyzer"],
+      "exploit_dev_01": ["evolutionary-fuzzer"]
+    }
   }
 }
