@@ -1,0 +1,30 @@
+env:
+  contexts:
+    - name: local-streaming
+      urls:
+        - http://127.0.0.1:3000
+      includePaths:
+        - http://127\.0\.0\.1:3000/.*
+      excludePaths:
+        - http://127\.0\.0\.1:3000/health
+  parameters:
+    failOnError: true
+    failOnWarning: false
+jobs:
+  - type: passiveScan-config
+    parameters:
+      scanOnlyInScope: true
+      enableTags: false
+  - type: spider
+    parameters:
+      context: local-streaming
+      maxDuration: 1
+  - type: passiveScan-wait
+    parameters:
+      maxDuration: 30
+  - type: report
+    parameters:
+      template: traditional-html-plus
+      reportDir: /zap/wrk/reports
+      reportFile: zap-passive-report.html
+      reportTitle: Local Streaming Passive Validation
