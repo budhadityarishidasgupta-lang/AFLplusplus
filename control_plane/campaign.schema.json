@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/control-plane/campaign.schema.json",
+  "title": "Bounded local campaign specification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["target", "limits", "strategy", "metadata"],
+  "properties": {
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "host", "port"],
+      "properties": {
+        "kind": {"const": "mock_http"},
+        "host": {"const": "127.0.0.1"},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_executions", "max_seconds", "max_input_bytes"],
+      "properties": {
+        "max_executions": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "max_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+        "max_input_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576}
+      }
+    },
+    "strategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mutation_profile", "seed"],
+      "properties": {
+        "mutation_profile": {"enum": ["balanced", "coverage", "havoc"]},
+        "seed": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "propertyNames": {"minLength": 1, "maxLength": 64},
+      "additionalProperties": {"type": "string", "maxLength": 1024}
+    }
+  }
+}
+
