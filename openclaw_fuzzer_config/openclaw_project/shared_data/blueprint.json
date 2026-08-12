@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "cycle_id": "unassigned",
+  "target": {
+    "kind": "local_mock",
+    "path": "sandbox/targets/",
+    "module": "unassigned"
+  },
+  "constraints": {
+    "minimum_length": 1,
+    "maximum_length": 32,
+    "encoding": "bytes"
+  },
+  "coverage_model": {
+    "metric": "branch_coverage",
+    "known_branches": []
+  },
+  "success_criteria": {
+    "retain_new_paths": true,
+    "stop_on_simulated_crash": true
+  },
+  "mutation_guidance": {
+    "channels": ["bit_flip", "token_delete", "havoc_insert"],
+    "tokens_hex": []
+  },
+  "safety": {
+    "local_mock_only": true,
+    "network_disabled_except_mock_target": true,
+    "target_host": "127.0.0.1",
+    "target_port": 3000
+  }
+}
