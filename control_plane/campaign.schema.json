@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/schemas/aflpp-campaign-v1.json",
+  "title": "AFL++ Campaign Specification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "campaign_id", "target", "limits", "strategy"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "campaign_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "identifier"],
+      "properties": {
+        "kind": {"enum": ["local_binary", "local_harness", "loopback_service"]},
+        "identifier": {"type": "string", "minLength": 1, "maxLength": 512},
+        "host": {"type": "string", "const": "127.0.0.1"},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_seconds", "max_executions", "max_input_bytes", "memory_mb"],
+      "properties": {
+        "max_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+        "max_executions": {"type": "integer", "minimum": 1, "maximum": 1000000000},
+        "max_input_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576},
+        "memory_mb": {"type": "integer", "minimum": 32, "maximum": 32768}
+      }
+    },
+    "strategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seed"],
+      "properties": {
+        "seed": {"type": "integer", "minimum": 0},
+        "dictionary_id": {"type": ["string", "null"], "maxLength": 128},
+        "mutation_profile": {"enum": ["default", "exploration", "exploitation", "adaptive"]}
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": {"type": "string", "maxLength": 1024},
+      "maxProperties": 32
+    }
+  }
+}
