@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "project": {
+    "name": "openclaw-local-fuzzer-playground",
+    "root": "."
+  },
+  "engineProfiles": {
+    "gpt-4o": {
+      "provider": "openai",
+      "model": "gpt-4o",
+      "temperature": 0.1
+    },
+    "gpt-4o-mini": {
+      "provider": "openai",
+      "model": "gpt-4o-mini",
+      "temperature": 0.2
+    }
+  },
+  "gateway": {
+    "bind": "127.0.0.1",
+    "port": 8080,
+    "remoteAccess": false,
+    "entryAgent": "recon_planner_01"
+  },
+  "agents": {
+    "list": [
+      {
+        "id": "recon_planner_01",
+        "workspace": "./agents/recon_planner",
+        "engineProfile": "gpt-4o",
+        "role": "lead",
+        "tools": {
+          "filesystem": {
+            "read": ["./agents/recon_planner", "./shared_data"],
+            "write": ["./shared_data/blueprint.json", "./shared_data/WORKFLOW_STATUS.md"]
+          },
+          "bash": false,
+          "network": false
+        },
+        "canDelegateTo": ["exploit_dev_01"]
+      },
+      {
+        "id": "exploit_dev_01",
+        "workspace": "./agents/exploit_developer",
+        "engineProfile": "gpt-4o-mini",
+        "role": "worker",
+        "tools": {
+          "filesystem": {
+            "read": ["./agents/exploit_developer", "./shared_data", "./sandbox/targets"],
+            "write": ["./shared_data/WORKFLOW_STATUS.md", "./shared_data/crashes", "./sandbox/corpus", "./sandbox/runtime"]
+          },
+          "bash": {
+            "enabled": true,
+            "workingDirectory": "./sandbox/runtime",
+            "allowedRoots": ["./sandbox", "./shared_data"],
+            "deniedRoots": ["/bin", "/boot", "/dev", "/etc", "/opt", "/proc", "/root", "/run", "/sbin", "/sys", "/usr", "/var"],
+            "timeoutSeconds": 30,
+            "maxOutputBytes": 1048576,
+            "allowBackgroundTasks": true
+          },
+          "network": {
+            "enabled": true,
+            "allow": [
+              {
+                "host": "127.0.0.1",
+                "port": 3000,
+                "purpose": "mock-target-only"
+              }
+            ],
+            "denyAllOtherDestinations": true
+          }
+        },
+        "canDelegateTo": []
+      }
+    ]
+  },
+  "orchestration": {
+    "sharedDirectory": "./shared_data",
+    "artifacts": {
+      "blueprint": "./shared_data/blueprint.json",
+      "workflowStatus": "./shared_data/WORKFLOW_STATUS.md",
+      "crashDirectory": "./shared_data/crashes"
+    },
+    "leadAgent": "recon_planner_01",
+    "workerAgent": "exploit_dev_01",
+    "maxCycles": 20,
+    "maxConcurrentWorkerTasks": 1
+  },
+  "sandbox": {
+    "target": {
+      "host": "127.0.0.1",
+      "port": 3000
+    },
+    "monitoring": {
+      "host": "127.0.0.1",
+      "port": 8080
+    },
+    "networkPolicy": "loopback-allowlist",
+    "targetsDirectory": "./sandbox/targets",
+    "corpusDirectory": "./sandbox/corpus",
+    "runtimeDirectory": "./sandbox/runtime"
+  }
+}
