@@ -1,67 +1,70 @@
-# OpenClaw local fuzzer cluster brief
+# OpenClaw local fuzzer cluster configuration brief
 
-This directory is a deployment **blueprint**, not an exploit deployment. It
-ports the planner/developer separation from `multi_agent_system.py` into two
-OpenClaw workspaces while keeping execution confined to mocked targets beneath
-`openclaw_project/sandbox/`.
+This package is a declarative workspace blueprint for a two-agent, local-only
+fuzzing playground. It contains no runtime implementation, exploit payload, or
+third-party endpoint integration. The runtime administrator remains responsible
+for validating the configuration against the installed OpenClaw release and
+enforcing its declared filesystem/network controls at the OS sandbox layer.
 
-## Design boundaries
+## Storage matrix
 
-- The gateway binds to loopback and has no webhook or remote-target binding.
-- The recon planner is the lead operator. It may read the local sandbox and
-  publish plans, but it cannot use shell or network tools.
-- The exploit developer may use a restricted local shell for bounded fuzzing
-  jobs. Prompt rules complement, but do not replace, OS/container isolation.
-- JSON messages are written atomically (`*.tmp`, validate, rename). Shared log
-  entries are append-only. Payloads are encoded as hex plus a SHA-256 digest;
-  raw bytes are never interpolated into shell commands.
-- `SOUL.md` describes role and intent; `AGENTS.md` describes workspace operating
-  rules. Enforcement belongs in the gateway policy and the sandbox runtime.
-
-## Layout
+All paths in `openclaw.json` are relative to `openclaw_project/`:
 
 ```text
-openclaw_project/
-├── openclaw.json
-├── WORKFLOW_STATUS.md
-├── agents/
-│   ├── recon_planner/
-│   │   ├── SOUL.md
-│   │   ├── AGENTS.md
-│   │   └── blueprint.json
-│   └── exploit_developer/
-│       ├── SOUL.md
-│       └── AGENTS.md
-├── logs/
-│   └── crashes/
-└── sandbox/
-    ├── targets/
-    ├── corpus/
-    └── runtime/
+openclaw_fuzzer_config/
+├── README.md
+└── openclaw_project/                    # OpenClaw daemon project root
+    ├── openclaw.json                    # engines, agents, tools, routing, sandbox
+    ├── agents/
+    │   ├── recon_planner/               # workspace: recon_planner_01
+    │   │   ├── SOUL.md                  # analytical defensive persona
+    │   │   └── AGENTS.md                # file and delegation boundaries
+    │   └── exploit_developer/           # workspace: exploit_dev_01
+    │       ├── SOUL.md                  # bounded evolutionary worker persona
+    │       └── AGENTS.md                # Bash and artifact boundaries
+    ├── shared_data/                     # shared orchestration folder
+    │   ├── blueprint.json               # recon strategy → worker parameters
+    │   ├── WORKFLOW_STATUS.md           # append-only coordination ledger
+    │   └── crashes/                     # structured simulated findings only
+    │       └── .gitkeep
+    └── sandbox/                         # isolated local playground
+        ├── targets/                     # mocked target assets
+        │   └── .gitkeep
+        ├── corpus/                      # generated local corpus
+        │   └── .gitkeep
+        └── runtime/                     # bounded task PID/state/output files
+            └── .gitkeep
 ```
 
-Runtime directories contain `.gitkeep` placeholders only. Put copied mock
-targets—not symlinks to external trees—under `sandbox/targets/`.
+## Configuration map
 
-## Deterministic routing sequence
+- `recon_planner_01` owns orchestration, uses the `gpt-4o` profile, reads shared
+  mock metadata, and writes the strategy and status artifacts. It has no Bash or
+  network permission.
+- `exploit_dev_01` uses `gpt-4o-mini`. Its Bash working directory is
+  `sandbox/runtime`, writable roots are limited to `sandbox` and `shared_data`,
+  and core paths including `/etc` and `/var` are explicitly denied.
+- The only worker network destination is the mock target at
+  `127.0.0.1:3000`; all other destinations are denied. Gateway/monitoring binds
+  to loopback at `127.0.0.1:8080`.
+- The shared artifacts are `shared_data/blueprint.json` and
+  `shared_data/WORKFLOW_STATUS.md`. Simulated finding metadata is isolated under
+  `shared_data/crashes/`.
 
-1. A local operator sends a task to the loopback Gateway.
-2. The Gateway selects `recon_planner`, attaches only its workspace instructions
-   and the shared status ledger, and assigns a correlation ID.
-3. Recon statically inspects `sandbox/targets/`, atomically updates
-   `agents/recon_planner/blueprint.json`, and appends a `PLAN_READY` ledger row.
-4. The Gateway validates that JSON against the documented shape, then forwards
-   the correlation ID and plan path—not an unconstrained transcript—to
-   `exploit_developer`.
-5. The developer runs one bounded local mock-target campaign, records fitness,
-   and appends `FEEDBACK_READY`. A simulated crash additionally creates a
-   structured record beneath `logs/crashes/`.
-6. The Gateway returns the feedback path to recon. Recon revises the next plan
-   or writes `COMPLETE`; retry number and seed make re-orchestration repeatable.
-7. Invalid messages become `BLOCKED` ledger entries and are never routed to a
-   shell-capable agent.
+## Context and handoff sequence
 
-The exact CLI used to start a Gateway varies by installed OpenClaw release.
-Validate `openclaw.json` with that release before startup; this blueprint keeps
-version-sensitive policy in one file for that reason.
+```text
+Local operator
+  → Gateway 127.0.0.1:8080 assigns cycle_id
+  → recon_planner_01 receives its SOUL/AGENTS context + shared metadata
+  → recon writes shared_data/blueprint.json and PLAN_READY ledger state
+  → Gateway validates cycle_id, safety flags, and artifact path
+  → exploit_dev_01 receives blueprint path (not an unrestricted transcript)
+  → worker runs one bounded mock-target cycle against 127.0.0.1:3000
+  → worker appends coverage outcome to WORKFLOW_STATUS.md
+  → Gateway returns normalized feedback to recon for re-plan or completion
+```
 
+Invalid paths, stale cycle identifiers, disabled safety flags, or destinations
+other than the loopback allowlist must transition the ledger to `BLOCKED` and
+must not reach the Bash-capable worker.
