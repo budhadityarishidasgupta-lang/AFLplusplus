@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "project": {
+    "name": "local-evolutionary-fuzzer",
+    "workspace": "."
+  },
+  "gateway": {
+    "bind": "127.0.0.1",
+    "remoteAccess": false,
+    "defaultAgent": "recon_planner"
+  },
+  "agents": {
+    "defaults": {
+      "sharedContext": [
+        "WORKFLOW_STATUS.md"
+      ],
+      "maxConcurrentRuns": 1
+    },
+    "list": [
+      {
+        "id": "recon_planner",
+        "name": "Recon Planner",
+        "workspace": "agents/recon_planner",
+        "role": "lead",
+        "tools": {
+          "allow": ["read", "write"],
+          "deny": ["network", "browser", "shell"]
+        },
+        "delegation": {
+          "allowAgents": ["exploit_developer"]
+        }
+      },
+      {
+        "id": "exploit_developer",
+        "name": "Exploit Developer",
+        "workspace": "agents/exploit_developer",
+        "role": "worker",
+        "tools": {
+          "allow": ["read", "write", "shell"],
+          "deny": ["network", "browser"]
+        },
+        "delegation": {
+          "allowAgents": []
+        }
+      }
+    ]
+  },
+  "routing": {
+    "entryAgent": "recon_planner",
+    "correlationField": "cycle_id",
+    "maxCycles": 20,
+    "handoffs": [
+      {
+        "from": "recon_planner",
+        "to": "exploit_developer",
+        "when": "PLAN_READY"
+      },
+      {
+        "from": "exploit_developer",
+        "to": "recon_planner",
+        "when": "FEEDBACK_READY"
+      }
+    ]
+  },
+  "sandbox": {
+    "targetsRoot": "sandbox/targets",
+    "corpusRoot": "sandbox/corpus",
+    "runtimeRoot": "sandbox/runtime",
+    "crashLogRoot": "logs/crashes",
+    "network": "disabled",
+    "commandTimeoutSeconds": 30,
+    "maxOutputBytes": 1048576
+  }
+}
+
