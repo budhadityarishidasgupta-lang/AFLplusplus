@@ -78,6 +78,15 @@ Invalid paths, stale cycle identifiers, disabled safety flags, or destinations
 other than the loopback allowlist must transition the ledger to `BLOCKED` and
 must not reach the Bash-capable worker.
 
+## Browser QA range
+
+`openclaw_project/enterprise_range.yaml` and
+`ENTERPRISE_RANGE_CONTRACT.md` define the optional dual-mode browser QA
+contract. It accepts zero-knowledge and credentialed loopback campaigns while
+explicitly forbidding automation concealment, fingerprint spoofing, remote
+proxies, and privilege-escalation fuzzing. The Python reference implementation
+is `../enterprise_stealth_range.py` from this directory.
+
 ## Skill placement
 
 The repository stores installable skill templates under `openclaw_home/skills/`
