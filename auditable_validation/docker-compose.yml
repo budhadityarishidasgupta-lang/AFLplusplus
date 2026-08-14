@@ -1,0 +1,41 @@
+services:
+  target:
+    image: ${TARGET_IMAGE:-python:3.12-slim}
+    working_dir: /app
+    volumes:
+      - ../sandbox_target:/app:ro
+    command: ["python", "mock_streaming_service.py", "--host", "0.0.0.0", "--port", "3000"]
+    expose: ["3000"]
+    networks: [isolated]
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+  authorization-worker:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - ./:/app:ro
+      - type: tmpfs
+        target: /runtime
+        tmpfs:
+          size: 67108864
+          mode: 0700
+      - ../audit:/audit
+      - ../reports:/reports
+    environment:
+      TARGET_SCOPE_URL: ${TARGET_SCOPE_URL:?Set TARGET_SCOPE_URL to an approved local staging/container URL}
+      CAMPAIGN_ID: ${CAMPAIGN_ID:-validation-01}
+      AUDIT_PATH: /audit/audit.jsonl
+    command: ["python", "authorization_adapter.py"]
+    depends_on: [target]
+    networks: [isolated]
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+networks:
+  isolated:
+    name: auditable_validation_isolated
+    driver: bridge
+    internal: true
