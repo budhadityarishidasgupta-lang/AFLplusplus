@@ -57,6 +57,7 @@ state:
     campaign: {generation: 0, fitness_score: 0, feedback: {}}
     assessment: {status: pending}
     final_report: {}
+    governance: {state: CLEAR, request_path: "./shared_data/governance/requests/Modification_Request.json", approval: null}
 
 policy:
   deterministic: true
@@ -165,10 +166,48 @@ steps:
         fitness_score: "${state.campaign.fitness_score}"
         generation: "${state.campaign.generation}"
 
-  - id: normalize_assessment
+  - id: check_structural_changes
     type: condition
     needs: [initial_fuzz_generation, evolve_until_threshold]
-    expression: "${state.campaign.fitness_score >= 100}"
+    expression: "${file_exists(state.governance.request_path)}"
+    on_true: system_architect_checkpoint
+    on_false: normalize_assessment
+
+  - id: system_architect_checkpoint
+    type: approval
+    agent: system_architect_01
+    needs: [check_structural_changes]
+    prompt: >-
+      CRITICAL SYSTEM MODIFICATION DETECTED. Review the redacted
+      Modification_Request.json and present: "CRITICAL SYSTEM MODIFICATION
+      DETECTED. Do you authorize consulting Codex/Manus to build and commit
+      this code change? [Yes/No]". Suspend all dependent execution until the
+      operator answers for the exact request digest.
+    input:
+      type: object
+      value:
+        request_path: "${state.governance.request_path}"
+        cycle_id: "${state.cycle_id}"
+    pause:
+      return: resumeToken
+      state_path: governance.resumeToken
+    resume:
+      token: "${resumeToken}"
+      decision_schema:
+        type: object
+        required: [approved, operator]
+        properties:
+          approved: {type: boolean}
+          operator: {type: string}
+          request_digest: {type: string}
+          comment: {type: string}
+      state_path: governance.approval
+    reject_transition: governance_rejected
+
+  - id: normalize_assessment
+    type: condition
+    needs: [check_structural_changes, system_architect_checkpoint]
+    expression: "${state.campaign.fitness_score >= 100 && state.governance.approval.approved != false}"
     on_true: final_logging_and_patch
     on_false: budget_exhausted_log
 
@@ -201,6 +240,14 @@ steps:
       state: COMPLETE_NO_THRESHOLD
       generation: "${state.campaign.generation}"
       fitness_score: "${state.campaign.fitness_score}"
+
+  - id: governance_rejected
+    type: ledger
+    append: "./shared_data/WORKFLOW_STATUS.md"
+    record:
+      cycle_id: "${state.cycle_id}"
+      state: STRUCTURAL_CHANGE_REJECTED
+      reason: operator_denied_modification_request
 
   - id: workflow_rejected
     type: ledger
