@@ -17,16 +17,20 @@ services:
     volumes:
       - ./:/app:ro
       - type: tmpfs
-        target: /runtime
+        target: /dev/shm/fuzzer_runtime
         tmpfs:
           size: 67108864
           mode: 0700
-      - ../audit:/audit
-      - ../reports:/reports
+      - ../logs:/logs
     environment:
-      TARGET_SCOPE_URL: ${TARGET_SCOPE_URL:?Set TARGET_SCOPE_URL to an approved local staging/container URL}
+      TARGET_SCOPE_URL: ${TARGET_SCOPE_URL:-http://target:3000}
+      ADMIN_LOGIN_PATH: ${ADMIN_LOGIN_PATH:-/admin/login}
+      CREATOR_SETTINGS_PATH: ${CREATOR_SETTINGS_PATH:-/api/v1/creators/creator_test_99/settings}
+      TEST_ACCOUNT_ID: ${TEST_ACCOUNT_ID:-creator_test_99}
+      RUNTIME_DIR: /dev/shm/fuzzer_runtime
       CAMPAIGN_ID: ${CAMPAIGN_ID:-validation-01}
-      AUDIT_PATH: /audit/audit.jsonl
+      AUDIT_PATH: /logs/audit_trail.csv
+      REPORT_PATH: /logs/PATCH_ADVISORY.md
     command: ["python", "authorization_adapter.py"]
     depends_on: [target]
     networks: [isolated]

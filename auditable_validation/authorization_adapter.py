@@ -2,6 +2,7 @@
 """Finite, read-only staging authorization assertions."""
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
@@ -13,8 +14,16 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from report_export import redact
+
 _ALLOWED_HOST = re.compile(r"^(localhost|127\.0\.0\.1|target|mock-streaming|[a-z0-9-]+\.local)$")
 _ALLOWED_PORTS = {80, 3000, 8000, 8080}
+ADMIN_LOGIN_PATH = os.environ.get("ADMIN_LOGIN_PATH", "/admin/login")
+CREATOR_SETTINGS_PATH = os.environ.get("CREATOR_SETTINGS_PATH", "/api/v1/creators/creator_test_99/settings")
+TEST_ACCOUNT_ID = os.environ.get("TEST_ACCOUNT_ID", "creator_test_99")
+RUNTIME_DIR = Path(os.environ.get("RUNTIME_DIR", "/dev/shm/fuzzer_runtime"))
+AUDIT_PATH = Path(os.environ.get("AUDIT_PATH", "./logs/audit_trail.csv"))
+REPORT_PATH = Path(os.environ.get("REPORT_PATH", "./logs/PATCH_ADVISORY.md"))
 
 
 @dataclass(frozen=True)
@@ -68,8 +77,8 @@ def run_assertions(target_url: str, *, max_attempts: int = 3) -> list[Assertion]
     if not 1 <= max_attempts <= 10:
         raise ValueError("max_attempts must be 1-10")
     cases = [
-        ("admin-boundary", "/admin/login", (401, 403)),
-        ("creator-isolation", "/api/v1/creators/creator_test_99/settings", (401, 403)),
+        ("admin-boundary", ADMIN_LOGIN_PATH, (401, 403)),
+        ("creator-isolation", CREATOR_SETTINGS_PATH, (401, 403)),
     ]
     results: list[Assertion] = []
     for assertion_id, path, expected in cases:
@@ -91,22 +100,36 @@ def run_assertions(target_url: str, *, max_attempts: int = 3) -> list[Assertion]
 
 def append_audit(events: list[Assertion], audit_path: Path, campaign_id: str) -> None:
     audit_path.parent.mkdir(parents=True, exist_ok=True)
-    record = {
-        "campaign_id": campaign_id,
-        "execution_hash": hashlib.sha256(json.dumps([asdict(e) for e in events], sort_keys=True).encode()).hexdigest(),
-        "events": [asdict(e) for e in events],
-    }
-    with audit_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, sort_keys=True) + "\n")
+    execution_hash = hashlib.sha256(json.dumps([asdict(e) for e in events], sort_keys=True).encode()).hexdigest()
+    fields = ["campaign_id", "execution_hash", "assertion_id", "phase", "method", "path", "expected_status", "observed_status", "outcome", "response_sha256", "detail"]
+    new_file = not audit_path.exists() or audit_path.stat().st_size == 0
+    with audit_path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        if new_file:
+            writer.writeheader()
+        for event in events:
+            row = asdict(event)
+            writer.writerow({"campaign_id": campaign_id, "execution_hash": execution_hash, **row, "expected_status": ";".join(map(str, event.expected_status))})
     audit_path.chmod(0o640)
+
+
+def write_developer_report(events: list[Assertion], report_path: Path) -> None:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# PATCH ADVISORY", "", "Generated from a finite, read-only staging authorization assertion run.", ""]
+    for event in events:
+        lines.append(f"- `{event.assertion_id}`: **{event.outcome}**; observed={event.observed_status}; expected={event.expected_status}; path=`{event.path}`")
+    report_path.write_text(redact("\n".join(lines) + "\n"), encoding="utf-8")
+    report_path.chmod(0o640)
 
 
 def main() -> int:
     target = os.environ.get("TARGET_SCOPE_URL", "")
     campaign = os.environ.get("CAMPAIGN_ID", "validation-01")
-    audit = Path(os.environ.get("AUDIT_PATH", "/audit/audit.jsonl"))
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    audit = Path(os.environ.get("AUDIT_PATH", str(AUDIT_PATH)))
     events = run_assertions(target)
     append_audit(events, audit, campaign)
+    write_developer_report(events, Path(os.environ.get("REPORT_PATH", str(REPORT_PATH))))
     for event in events:
         print(json.dumps(asdict(event), sort_keys=True))
     return 1 if any(event.outcome == "FINDING" for event in events) else 0
