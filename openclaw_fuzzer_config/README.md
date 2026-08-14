@@ -87,7 +87,8 @@ explicitly forbidding automation concealment, fingerprint spoofing, remote
 proxies, and privilege-escalation fuzzing. The Python reference implementation
 is `../enterprise_stealth_range.py` from this directory. Unified campaign
 loading and process-bound `/dev/shm` session leases are implemented by
-`../campaign_session_manager.py`.
+`../campaign_session_manager.py`. `../system_supervisor.py` supplies the
+loopback live-command listener and asynchronous manual-approval gate.
 
 ## Skill placement
 

@@ -25,10 +25,17 @@ An unexpected boundary condition stops browser activity before recording a
 SHA-256 classification and short secret-redacted fingerprint. The pipeline may
 resume only after an explicit terminal Yes decision.
 
-The asynchronous live channel accepts newline-delimited JSON for `set_path`,
-bounded `set_pacing_ms`, and `snapshot`. Every accepted or rejected command is
-audited. Commands cannot change host, credentials, network policy, or safety
-limits.
+The background TCP live channel binds only to `127.0.0.1` and accepts `PAUSE`,
+`CANCEL`, `STATUS_REPORT`, and bounded
+`ADJUST_SPEED_JITTER=<milliseconds>` text records. Every accepted or rejected
+command is audited. There is no target/domain mutation command, and all such
+input is dropped before it reaches the supervisor.
+
+Response anomalies, failed boundary checks, and completed validation budgets
+publish typed pause events to `SystemSupervisor`. The primary execution path
+waits on an asynchronous gate while the supervisor presents the exact approval
+prompt. A separate verification callback runs only after an affirmative answer
+and is contractually read-only.
 
 ## Session ingestion and lifetime
 

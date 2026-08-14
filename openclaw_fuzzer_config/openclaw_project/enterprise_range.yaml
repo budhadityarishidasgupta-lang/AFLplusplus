@@ -24,8 +24,16 @@ session:
   artifact_fields: [cookies, tokens, verification]
   unmount_shared_tmpfs: forbidden
 live_commands:
-  allowed: [set_path, set_pacing_ms, snapshot]
-  pacing_ms: {minimum: 0, maximum: 15000}
+  transport: tcp-loopback
+  listener: LiveCommandChannel
+  allowed: [PAUSE, CANCEL, STATUS_REPORT, ADJUST_SPEED_JITTER]
+  speed_jitter_ms: {minimum: 0, maximum: 15000}
+  target_mutation: forbidden
+supervisor:
+  implementation: ../../system_supervisor.py
+  pause_reasons: [RESPONSE_ANOMALY, BOUNDARY_CHECK_FAILED, VALIDATION_BUDGET_FINISHED]
+  verification_mode: read-only
+  manual_approval: required
 audit:
   append_only_path: ./logs/audit_trail.csv
   budget_alert_path: ./TIMEOUT_ALERT.md
