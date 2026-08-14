@@ -29,3 +29,18 @@ The asynchronous live channel accepts newline-delimited JSON for `set_path`,
 bounded `set_pacing_ms`, and `snapshot`. Every accepted or rejected command is
 audited. Commands cannot change host, credentials, network policy, or safety
 limits.
+
+## Session ingestion and lifetime
+
+`campaign_session_manager.py` consumes one unified object: all five campaign
+keys are present, with authentication fields set either entirely to `null` or
+to a complete credentialed configuration. The baseline runner receives only
+the target URL. The authenticated runner receives credentials in memory and
+returns only the allowlisted `cookies`, `tokens`, and `verification` fields.
+
+Session JSON is written to an unlinked `0600` file in the existing
+`/dev/shm/session_core/` tmpfs and accessed through an `mmap` lease. Because the
+file has no directory entry, the kernel releases it when its descriptor closes
+or the process terminates, including uncatchable termination. Cleanup removes
+the empty, mode-`0700` application directory. The application never unmounts
+the system-owned `/dev/shm` filesystem.

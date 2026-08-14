@@ -85,7 +85,9 @@ must not reach the Bash-capable worker.
 contract. It accepts zero-knowledge and credentialed loopback campaigns while
 explicitly forbidding automation concealment, fingerprint spoofing, remote
 proxies, and privilege-escalation fuzzing. The Python reference implementation
-is `../enterprise_stealth_range.py` from this directory.
+is `../enterprise_stealth_range.py` from this directory. Unified campaign
+loading and process-bound `/dev/shm` session leases are implemented by
+`../campaign_session_manager.py`.
 
 ## Skill placement
 
