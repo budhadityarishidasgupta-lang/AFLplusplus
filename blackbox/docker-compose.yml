@@ -1,0 +1,41 @@
+services:
+  target:
+    image: ${TARGET_IMAGE:-python:3.12-slim}
+    working_dir: /app
+    volumes:
+      - ../sandbox_target:/app:ro
+    command: ["python", "mock_streaming_service.py", "--host", "0.0.0.0", "--port", "3000"]
+    expose:
+      - "3000"
+    networks:
+      - isolated
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+
+  blackbox-worker:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - ./:/app:ro
+      - ../reports:/reports
+    environment:
+      TARGET_SCOPE_URL: ${TARGET_SCOPE_URL:?Set TARGET_SCOPE_URL to an approved local/container URL}
+      RUN_DIR: /reports
+    command: ["python", "init_blackbox.py"]
+    depends_on:
+      - target
+    networks:
+      - isolated
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    # No ports are published. The worker is reachable only on the internal network.
+
+networks:
+  isolated:
+    internal: true
+    driver: bridge
+    name: blackbox_isolated
