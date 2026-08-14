@@ -24,6 +24,7 @@ TEST_ACCOUNT_ID = os.environ.get("TEST_ACCOUNT_ID", "creator_test_99")
 RUNTIME_DIR = Path(os.environ.get("RUNTIME_DIR", "/dev/shm/fuzzer_runtime"))
 AUDIT_PATH = Path(os.environ.get("AUDIT_PATH", "./logs/audit_trail.csv"))
 REPORT_PATH = Path(os.environ.get("REPORT_PATH", "./logs/PATCH_ADVISORY.md"))
+TIMEOUT_ALERT_PATH = Path(os.environ.get("TIMEOUT_ALERT_PATH", "./logs/TIMEOUT_ALERT.md"))
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,14 @@ class Assertion:
     detail: str
 
 
+class BudgetExhaustedError(RuntimeError):
+    def __init__(self, attempts: int, budget: int, events: list[Assertion]):
+        super().__init__(f"attempt budget exhausted: {attempts}>{budget}")
+        self.attempts = attempts
+        self.budget = budget
+        self.events = events
+
+
 def _fingerprint(body: bytes) -> str:
     return hashlib.sha256(body).hexdigest()
 
@@ -72,20 +81,28 @@ def _request(scope: Scope, path: str, *, timeout: float = 5.0) -> tuple[int, byt
         return error.code, error.read(8192)
 
 
-def run_assertions(target_url: str, *, max_attempts: int = 3) -> list[Assertion]:
+def run_assertions(target_url: str, *, max_attempts: int = 3, attempt_budget: int = 500, repetitions: int = 1) -> list[Assertion]:
     scope = validate_target(target_url)
     if not 1 <= max_attempts <= 10:
         raise ValueError("max_attempts must be 1-10")
+    if not 1 <= attempt_budget <= 500:
+        raise ValueError("attempt_budget must be 1-500")
+    if not 1 <= repetitions <= 1000:
+        raise ValueError("repetitions must be 1-1000")
     cases = [
         ("admin-boundary", ADMIN_LOGIN_PATH, (401, 403)),
         ("creator-isolation", CREATOR_SETTINGS_PATH, (401, 403)),
     ]
     results: list[Assertion] = []
+    current_attempts = 0
     for assertion_id, path, expected in cases:
         status = None
         digest = None
         detail = ""
-        for _ in range(min(max_attempts, 1)):
+        for _ in range(repetitions):
+            if current_attempts > attempt_budget:
+                raise BudgetExhaustedError(current_attempts, attempt_budget, results)
+            current_attempts += 1
             started = time.monotonic()
             try:
                 status, body = _request(scope, path)
@@ -95,6 +112,8 @@ def run_assertions(target_url: str, *, max_attempts: int = 3) -> list[Assertion]
                 detail = type(error).__name__
         outcome = "PASS" if status in expected else ("FINDING" if status in (200, 204) else "ERROR")
         results.append(Assertion(assertion_id, "authorization", "GET", path, expected, status, outcome, digest, detail))
+    if current_attempts > attempt_budget:
+        raise BudgetExhaustedError(current_attempts, attempt_budget, results)
     return results
 
 
@@ -110,7 +129,23 @@ def append_audit(events: list[Assertion], audit_path: Path, campaign_id: str) ->
         for event in events:
             row = asdict(event)
             writer.writerow({"campaign_id": campaign_id, "execution_hash": execution_hash, **row, "expected_status": ";".join(map(str, event.expected_status))})
+        handle.flush()
+        os.fsync(handle.fileno())
     audit_path.chmod(0o640)
+
+
+def write_timeout_alert(error: BudgetExhaustedError, alert_path: Path, campaign_id: str) -> None:
+    alert_path.parent.mkdir(parents=True, exist_ok=True)
+    alert_path.write_text(
+        "# TIMEOUT ALERT\n\n"
+        f"- Campaign: `{campaign_id}`\n"
+        f"- Status: `BUDGET_EXHAUSTED`\n"
+        f"- Attempts: `{error.attempts}`\n"
+        f"- Budget: `{error.budget}`\n"
+        "- Action: supervisor review required; no further attempts were issued.\n",
+        encoding="utf-8",
+    )
+    alert_path.chmod(0o640)
 
 
 def write_developer_report(events: list[Assertion], report_path: Path) -> None:
@@ -127,7 +162,17 @@ def main() -> int:
     campaign = os.environ.get("CAMPAIGN_ID", "validation-01")
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     audit = Path(os.environ.get("AUDIT_PATH", str(AUDIT_PATH)))
-    events = run_assertions(target)
+    try:
+        events = run_assertions(target)
+    except BudgetExhaustedError as error:
+        events = list(error.events)
+        events.append(Assertion("budget-exhausted", "governance", "N/A", "N/A", (), None, "BUDGET_EXHAUSTED", None, f"attempts={error.attempts};budget={error.budget}"))
+        append_audit(events, audit, campaign)
+        write_timeout_alert(error, Path(os.environ.get("TIMEOUT_ALERT_PATH", str(TIMEOUT_ALERT_PATH))), campaign)
+        write_developer_report(events, Path(os.environ.get("REPORT_PATH", str(REPORT_PATH))))
+        for event in events:
+            print(json.dumps(asdict(event), sort_keys=True))
+        return 2
     append_audit(events, audit, campaign)
     write_developer_report(events, Path(os.environ.get("REPORT_PATH", str(REPORT_PATH))))
     for event in events:

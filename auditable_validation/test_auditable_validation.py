@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from authorization_adapter import run_assertions, validate_target, append_audit
+from authorization_adapter import BudgetExhaustedError, append_audit, run_assertions, validate_target, write_developer_report, write_timeout_alert
 from report_export import redact
 
 
@@ -26,6 +26,19 @@ class AuditableValidationTests(unittest.TestCase):
             path = Path(directory) / "audit.jsonl"
             append_audit([], path, "campaign-1")
             self.assertIn("execution_hash", path.read_text(encoding="utf-8"))
+
+    def test_budget_exhaustion_carries_prior_events(self):
+        with self.assertRaises(BudgetExhaustedError) as context:
+            run_assertions("http://target:3000", attempt_budget=500, repetitions=501)
+        error = context.exception
+        self.assertGreater(error.attempts, error.budget)
+        self.assertEqual(error.budget, 500)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            alert = root / "TIMEOUT_ALERT.md"
+            write_timeout_alert(error, alert, "campaign-budget")
+            self.assertIn("BUDGET_EXHAUSTED", alert.read_text(encoding="utf-8"))
+            self.assertIn("campaign-budget", alert.read_text(encoding="utf-8"))
 
     def test_export_redacts_sensitive_values(self):
         output = redact("Authorization: Bearer abc123 password=secret cookie: sid=xyz")
