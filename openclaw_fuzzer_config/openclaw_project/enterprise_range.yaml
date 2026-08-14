@@ -1,0 +1,47 @@
+version: 1
+contract: bounded-browser-qa
+campaign_scope: ../../campaign_scope.json
+network:
+  policy: loopback-only
+  allowed_hosts: [127.0.0.1]
+  external_proxies: forbidden
+browser:
+  automation_disclosed: true
+  cdp_evasion_scripts: forbidden
+  fingerprint_randomization: forbidden
+  viewport: [1440, 900]
+execution:
+  attempt_budget: 500
+  zero_knowledge_phase: login_gate_analysis
+  credentialed_phase: authenticated_authorization_checks
+  session_storage: memory-only
+  boundary_state: APPROVAL_REQUIRED
+session:
+  manager: ../../campaign_session_manager.py
+  storage: /dev/shm/session_core
+  storage_model: unlinked-mmap
+  directory_mode: "0700"
+  artifact_fields: [cookies, tokens, verification]
+  unmount_shared_tmpfs: forbidden
+live_commands:
+  transport: tcp-loopback
+  listener: LiveCommandChannel
+  allowed: [PAUSE, CANCEL, STATUS_REPORT, ADJUST_SPEED_JITTER]
+  speed_jitter_ms: {minimum: 0, maximum: 15000}
+  target_mutation: forbidden
+supervisor:
+  implementation: ../../system_supervisor.py
+  pause_reasons: [RESPONSE_ANOMALY, BOUNDARY_CHECK_FAILED, VALIDATION_BUDGET_FINISHED]
+  verification_mode: read-only
+  manual_approval: required
+launcher:
+  implementation: ../../conversational_launcher.py
+  prompt: "AdminConsole> "
+  scope_file: ../../campaign_scope.json
+  default_worker: ../../campaign_session_manager.py
+  runtime_commands: [status, pause, resume, cancel]
+  active_scope_mutation: forbidden
+  denial_report: ../../CLIENT_REPORT.md
+audit:
+  append_only_path: ./logs/audit_trail.csv
+  budget_alert_path: ./TIMEOUT_ALERT.md
