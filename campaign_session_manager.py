@@ -8,6 +8,7 @@ This module never attempts to unmount the host's shared tmpfs.
 
 from __future__ import annotations
 
+import argparse
 import json
 import mmap
 import os
@@ -200,3 +201,29 @@ class CampaignSessionManager:
         return SessionIngestionResult(
             ExecutionMode.AUTHENTICATED_SESSION, scope.target_scope_url, lease
         )
+
+
+def _inspect_scope(path: Path) -> int:
+    """CLI preflight used by the launcher; never performs browser/network I/O."""
+    scope = CampaignSessionManager.load_scope(path)
+    mode = (
+        ExecutionMode.EXTERNAL_PERIMETER_AUDIT
+        if scope.username is None
+        else ExecutionMode.AUTHENTICATED_SESSION
+    )
+    print(f"EXECUTION_MODE: {mode.value}", flush=True)
+    print("SESSION_STORAGE: /dev/shm/session_core (unlinked mmap)", flush=True)
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--inspect", type=Path, metavar="CAMPAIGN_SCOPE")
+    arguments = parser.parse_args()
+    if arguments.inspect is None:
+        parser.error("--inspect CAMPAIGN_SCOPE is required")
+    return _inspect_scope(arguments.inspect)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

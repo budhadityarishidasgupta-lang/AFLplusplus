@@ -88,7 +88,10 @@ proxies, and privilege-escalation fuzzing. The Python reference implementation
 is `../enterprise_stealth_range.py` from this directory. Unified campaign
 loading and process-bound `/dev/shm` session leases are implemented by
 `../campaign_session_manager.py`. `../system_supervisor.py` supplies the
-loopback live-command listener and asynchronous manual-approval gate.
+loopback live-command listener and asynchronous manual-approval gate. The
+administrator entry point and worker protocol are documented in
+`LAUNCHER_CONFIGURATION_MAP.md` and implemented by
+`../conversational_launcher.py`.
 
 ## Skill placement
 

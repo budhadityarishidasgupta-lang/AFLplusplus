@@ -34,6 +34,14 @@ supervisor:
   pause_reasons: [RESPONSE_ANOMALY, BOUNDARY_CHECK_FAILED, VALIDATION_BUDGET_FINISHED]
   verification_mode: read-only
   manual_approval: required
+launcher:
+  implementation: ../../conversational_launcher.py
+  prompt: "AdminConsole> "
+  scope_file: ../../campaign_scope.json
+  default_worker: ../../campaign_session_manager.py
+  runtime_commands: [status, pause, resume, cancel]
+  active_scope_mutation: forbidden
+  denial_report: ../../CLIENT_REPORT.md
 audit:
   append_only_path: ./logs/audit_trail.csv
   budget_alert_path: ./TIMEOUT_ALERT.md
