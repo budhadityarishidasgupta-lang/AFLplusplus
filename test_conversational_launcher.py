@@ -40,9 +40,14 @@ class ConversationalParserTests(unittest.TestCase):
             with self.subTest(command=command), self.assertRaises(LauncherError):
                 parse_campaign_command(command)
 
-    def test_external_url_is_rejected(self):
-        with self.assertRaises(ConfigurationError):
-            parse_campaign_command("test https://example.com user=qa pass=test")
+    def test_well_formed_public_url_is_accepted(self):
+        campaign = parse_campaign_command("test https://example.com/app user=qa pass=test")
+        self.assertEqual(campaign.payload["target_scope_url"], "https://example.com/app")
+
+    def test_non_http_and_credentialed_urls_are_rejected(self):
+        for target in ("ftp://example.com", "https://user:secret@example.com"):
+            with self.subTest(target=target), self.assertRaises(ConfigurationError):
+                parse_campaign_command(f"test {target}")
 
     def test_scope_file_is_owner_only_and_complete(self):
         campaign = parse_campaign_command("test http://127.0.0.1:3000/")

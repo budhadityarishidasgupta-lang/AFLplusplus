@@ -30,11 +30,17 @@ class EnterpriseRangeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(architect.preflight(zero)["phase"], "login_gate_analysis")
         self.assertEqual(architect.preflight(auth)["phase"], "authenticated_authorization_checks")
 
-    def test_external_targets_and_proxies_rejected(self):
-        with self.assertRaises(ConfigurationError):
-            AuthorizationScenarioAdapter.from_payload({"target_scope_url": "https://example.com"})
-        with self.assertRaises(ConfigurationError): ProxyConfiguration("http://example.com:8080")
+    def test_public_targets_and_proxies_are_accepted(self):
+        scope = AuthorizationScenarioAdapter.from_payload({"target_scope_url": "https://example.com"})
+        proxy = ProxyConfiguration("http://proxy.example.com:8080")
+        self.assertEqual(scope.target_scope_url, "https://example.com")
+        self.assertEqual(proxy.server, "http://proxy.example.com:8080")
         with self.assertRaises(ConfigurationError): BrowserConfiguration(automation_disclosed=False)
+
+    def test_camofox_connection_is_part_of_browser_initialization(self):
+        model = HardenedBrowserRunner(FakeBrowser()).initialization_model()
+        self.assertEqual(model["communication_endpoint"], "http://localhost:9377")
+        self.assertEqual(model["human_delay_seconds"], {"minimum": 3.0, "maximum": 15.0})
 
     def test_bezier_trajectory_has_endpoints(self):
         points = simulate_mouse_trajectory((0, 0), (100, 50), steps=10)

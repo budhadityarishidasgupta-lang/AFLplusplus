@@ -1,14 +1,21 @@
-"""Central asynchronous pause gate and loopback-only live command listener."""
+"""Central asynchronous pause gate and local live command listener."""
 
 from __future__ import annotations
 
 import asyncio
+import csv
+import hashlib
+import os
 import socket
 import threading
+from datetime import UTC, datetime
+from pathlib import Path
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
+
+from enterprise_stealth_range import validate_public_url
 
 CONFIRMATION_PROMPT = (
     "VULNERABILITY ANOMALY DETECTED. Do you authorize running a separate, "
@@ -16,6 +23,11 @@ CONFIRMATION_PROMPT = (
 )
 MAX_COMMAND_BYTES = 256
 MAX_JITTER_MS = 15_000
+
+
+def validate_target_url(value: str) -> str:
+    """Validate a campaign URL without constraining its public network host."""
+    return validate_public_url(value, "target URL")
 
 
 class PauseReason(str, Enum):
@@ -185,11 +197,20 @@ class SystemSupervisor:
         read_only_verification: Callable[[SystemPauseEvent], Awaitable[None]],
         status_reporter: Callable[[], None] | None = None,
         audit: CommandAudit | None = None,
+        logs_path: Path = Path("logs"),
+        report_path: Path = Path("CLIENT_REPORT.md"),
     ) -> None:
         self._prompt = prompt
         self._verify = read_only_verification
         self._status_reporter = status_reporter or (lambda: None)
         self._audit = audit or (lambda _event, _detail: None)
+        self._logs_path = logs_path
+        self._logs_path.mkdir(parents=True, exist_ok=True)
+        self._audit_path = self._logs_path / "audit_trail.csv"
+        self._report_path = report_path
+        self._telemetry: list[str] = []
+        self._target_url: str | None = None
+        self._finalized = False
         self._events: asyncio.Queue[SystemPauseEvent | None] = asyncio.Queue()
         self._execution_gate = asyncio.Event()
         self._execution_gate.set()
@@ -200,9 +221,10 @@ class SystemSupervisor:
         self.speed_jitter_ms = 0
         self.channel: LiveCommandChannel | None = None
 
-    async def start(self, *, command_port: int = 0) -> None:
+    async def start(self, *, command_port: int = 0, target_url: str | None = None) -> None:
         if self._monitor is not None:
             raise RuntimeError("SystemSupervisor is already started")
+        self._target_url = validate_target_url(target_url) if target_url is not None else None
         loop = asyncio.get_running_loop()
         self.channel = LiveCommandChannel(
             lambda command: loop.call_soon_threadsafe(self._handle_command, command),
@@ -232,6 +254,7 @@ class SystemSupervisor:
             self.state = SupervisorState.PAUSED
             self._approval_active = True
             self._audit("system_pause", f"{event.reason.value}:{event.source}")
+            self._telemetry.append(f"system_pause:{event.reason.value}:{event.source}")
             try:
                 answer = (await self._prompt(CONFIRMATION_PROMPT)).strip().lower()
                 if answer in {"yes", "y"}:
@@ -253,6 +276,8 @@ class SystemSupervisor:
             self.state = SupervisorState.CANCELLED
             self._cancelled.set()
             self._execution_gate.set()
+            self._telemetry.append("command:CANCEL")
+            self._write_terminal_artifacts("cancelled")
         elif command.name == "STATUS_REPORT":
             self._status_reporter()
         elif command.name == "ADJUST_SPEED_JITTER":
@@ -274,3 +299,41 @@ class SystemSupervisor:
             self._monitor = None
         self.state = SupervisorState.STOPPED
         self._execution_gate.set()
+        self._write_terminal_artifacts("stopped")
+
+    def _write_terminal_artifacts(self, outcome: str) -> None:
+        """Durably emit one terminal audit row and a baseline client report."""
+        if self._finalized:
+            return
+        self._finalized = True
+        timestamp = datetime.now(UTC).isoformat()
+        telemetry = "\n".join(self._telemetry) or "(no supervisor telemetry)"
+        tracking_hash = hashlib.sha256(
+            f"{timestamp}\0{outcome}\0{telemetry}".encode()
+        ).hexdigest()
+        new_file = not self._audit_path.exists()
+        with self._audit_path.open("a", encoding="utf-8", newline="") as output:
+            writer = csv.writer(output)
+            if new_file:
+                writer.writerow(("timestamp", "tracking_hash", "outcome", "telemetry"))
+            writer.writerow((timestamp, tracking_hash, outcome, telemetry))
+            output.flush()
+            os.fsync(output.fileno())
+
+        target_hash = (
+            hashlib.sha256(self._target_url.encode()).hexdigest()
+            if self._target_url is not None
+            else "unavailable"
+        )
+        self._report_path.parent.mkdir(parents=True, exist_ok=True)
+        self._report_path.write_text(
+            "# Client report\n\n## Executive summary\n\n"
+            f"Supervisor ended with `{outcome}`.\n\n"
+            "## Coverage\n\n- Checked sub-routes: `worker-reported routes`\n"
+            "- Parameters evaluated: `worker-reported parameters`\n"
+            f"- Target classification: `{target_hash}`\n\n"
+            "## Tracking\n\n"
+            f"- Timestamp (UTC): `{timestamp}`\n"
+            f"- Tracking hash: `{tracking_hash}`\n",
+            encoding="utf-8",
+        )

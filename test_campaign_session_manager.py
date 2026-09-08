@@ -11,6 +11,10 @@ from campaign_session_manager import (
 from enterprise_stealth_range import ConfigurationError
 
 
+async def no_delay():
+    return 0.0
+
+
 class FakeSessionBrowser:
     def __init__(self):
         self.external = []
@@ -50,6 +54,7 @@ class CampaignSessionManagerTests(unittest.IsolatedAsyncioTestCase):
                 browser,
                 VolatileSessionStore(Path(directory) / "sessions", require_shm=False),
                 messages.append,
+                no_delay,
             )
             result = await manager.ingest(scope)
             self.assertEqual(result.mode, ExecutionMode.EXTERNAL_PERIMETER_AUDIT)
@@ -71,7 +76,7 @@ class CampaignSessionManagerTests(unittest.IsolatedAsyncioTestCase):
             browser = FakeSessionBrowser()
             root = Path(directory) / "sessions"
             store = VolatileSessionStore(root, require_shm=False)
-            result = await CampaignSessionManager(browser, store, lambda _: None).ingest(scope)
+            result = await CampaignSessionManager(browser, store, lambda _: None, no_delay).ingest(scope)
             self.assertEqual(result.mode, ExecutionMode.AUTHENTICATED_SESSION)
             self.assertEqual(browser.logins[0][0], "http://127.0.0.1:3000/login")
             self.assertEqual(list(root.iterdir()), [])
