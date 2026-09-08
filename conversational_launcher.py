@@ -1,4 +1,4 @@
-"""Conversational, loopback-only launcher for bounded validation workers.
+"""Conversational launcher for bounded, authorized validation workers.
 
 The launcher owns scope parsing, subprocess lifecycle, console serialization,
 and approval messages. It does not implement browser actions. A worker is a
@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
+from datetime import UTC, datetime
 import hashlib
 import json
 import os
@@ -20,6 +22,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from enterprise_stealth_range import AuthorizationScenarioAdapter, ConfigurationError
 
@@ -147,12 +150,16 @@ class ConversationalLauncher:
         scope_path: Path = Path("campaign_scope.json"),
         session_root: Path = Path("/dev/shm/session_core"),
         report_path: Path = Path("CLIENT_REPORT.md"),
+        logs_path: Path = Path("logs"),
         worker_command: tuple[str, ...] | None = None,
     ) -> None:
         self.console = console
         self.scope_path = scope_path
         self.session_root = session_root
         self.report_path = report_path
+        self.logs_path = logs_path
+        self.logs_path.mkdir(parents=True, exist_ok=True)
+        self.audit_path = self.logs_path / "audit_trail.csv"
         self.worker_command = worker_command or (
             sys.executable,
             str(Path(__file__).with_name("campaign_session_manager.py")),
@@ -164,6 +171,9 @@ class ConversationalLauncher:
         self._output_task: asyncio.Task[None] | None = None
         self._campaign: ParsedCampaign | None = None
         self._approval_lock = asyncio.Lock()
+        self._telemetry: list[str] = []
+        self._finalized_processes: set[int] = set()
+        self._termination_outcomes: dict[int, str] = {}
 
     async def run(self) -> None:
         await self.console.write("Bounded validation console ready. Type 'quit' to exit.")
@@ -201,13 +211,19 @@ class ConversationalLauncher:
         self.session_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.session_root.chmod(0o700)
         self._campaign = campaign
-        self.process = await asyncio.create_subprocess_exec(
-            *self.worker_command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
-        )
+        self._telemetry = []
+        try:
+            self.process = await asyncio.create_subprocess_exec(
+                *self.worker_command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except BaseException as error:
+            self._telemetry.append(f"launcher_error: {type(error).__name__}: {error}")
+            self._finalize_campaign(id(campaign), "launch_anomaly")
+            raise
         self.state = CampaignState.RUNNING
         self._output_task = asyncio.create_task(self._relay_worker_output())
         await self.console.write(f"Campaign started in {campaign.mode} mode.")
@@ -215,13 +231,25 @@ class ConversationalLauncher:
     async def _relay_worker_output(self) -> None:
         assert self.process is not None and self.process.stdout is not None
         process = self.process
-        while line := await process.stdout.readline():
-            message = line.decode("utf-8", errors="replace").rstrip()
-            if message.startswith(EVENT_PREFIX):
-                await self._checkpoint(message.removeprefix(EVENT_PREFIX).strip())
-            else:
-                await self.console.write(f"[worker] {message}")
-        returncode = await process.wait()
+        outcome = "runtime_anomaly"
+        try:
+            while line := await process.stdout.readline():
+                message = line.decode("utf-8", errors="replace").rstrip()
+                self._telemetry.append(message)
+                if message.startswith(EVENT_PREFIX):
+                    await self._checkpoint(message.removeprefix(EVENT_PREFIX).strip())
+                else:
+                    await self.console.write(f"[worker] {message}")
+            returncode = await process.wait()
+            outcome = self._termination_outcomes.pop(
+                process.pid, f"worker_exit_{returncode}"
+            )
+        except BaseException as error:
+            self._telemetry.append(f"relay_error: {type(error).__name__}: {error}")
+            outcome = self._termination_outcomes.pop(process.pid, outcome)
+            raise
+        finally:
+            self._finalize_campaign(process.pid, outcome)
         if self.process is process and self.state not in {
             CampaignState.CANCELLED,
             CampaignState.APPROVAL_REQUIRED,
@@ -287,6 +315,7 @@ class ConversationalLauncher:
             self.state = CampaignState.IDLE
             return
         os.killpg(process.pid, signal.SIGCONT)
+        self._termination_outcomes[process.pid] = "cancelled"
         os.killpg(process.pid, signal.SIGTERM)
         try:
             await asyncio.wait_for(process.wait(), timeout=3)
@@ -295,6 +324,7 @@ class ConversationalLauncher:
             await process.wait()
         self.state = CampaignState.CANCELLED
         self._wipe_session_cache()
+        self._finalize_campaign(process.pid, "cancelled")
 
     async def _send_worker(self, command: str) -> None:
         if self.process is None or self.process.stdin is None or self.process.stdin.is_closing():
@@ -319,12 +349,61 @@ class ConversationalLauncher:
             target = str(self._campaign.payload["target_scope_url"])
             target_hash = hashlib.sha256(target.encode()).hexdigest()
             mode = self._campaign.mode
+        self.report_path.parent.mkdir(parents=True, exist_ok=True)
         self.report_path.write_text(
             "# Client report\n\n"
             f"- Campaign mode: `{mode}`\n"
             f"- Target classification: `{target_hash}`\n"
             f"- Outcome: {outcome}\n\n"
             "Credentials, URLs, cookies, tokens, and response bodies were redacted.\n",
+            encoding="utf-8",
+        )
+
+    def _finalize_campaign(self, process_id: int, outcome: str) -> None:
+        """Synchronously persist the audit and report before control is returned."""
+        if process_id in self._finalized_processes:
+            return
+        self._finalized_processes.add(process_id)
+        timestamp = datetime.now(UTC).isoformat()
+        telemetry = "\n".join(self._telemetry) or "(no worker telemetry)"
+        tracking_hash = hashlib.sha256(
+            f"{timestamp}\0{process_id}\0{outcome}\0{telemetry}".encode()
+        ).hexdigest()
+        new_file = not self.audit_path.exists()
+        with self.audit_path.open("a", encoding="utf-8", newline="") as output:
+            writer = csv.writer(output)
+            if new_file:
+                writer.writerow(("timestamp", "tracking_hash", "outcome", "telemetry"))
+            writer.writerow((timestamp, tracking_hash, outcome, telemetry))
+            output.flush()
+            os.fsync(output.fileno())
+
+        route = "/"
+        mode = "unavailable"
+        parameter_names = "none"
+        target_hash = "unavailable"
+        if self._campaign is not None:
+            target = str(self._campaign.payload["target_scope_url"])
+            route = urlsplit(target).path or "/"
+            target_hash = hashlib.sha256(target.encode()).hexdigest()
+            mode = self._campaign.mode
+            if mode == "authenticated":
+                auth = str(self._campaign.payload["auth_entry_route"])
+                route = f"{route}, {urlsplit(auth).path or '/'}"
+                parameter_names = "username, password, role_profile"
+        self.report_path.parent.mkdir(parents=True, exist_ok=True)
+        self.report_path.write_text(
+            "# Client report\n\n"
+            "## Executive summary\n\n"
+            f"Authorized `{mode}` validation ended with `{outcome}`.\n\n"
+            "## Coverage\n\n"
+            f"- Checked sub-routes: `{route}`\n"
+            f"- Parameters evaluated: `{parameter_names}`\n"
+            f"- Target classification: `{target_hash}`\n\n"
+            "## Tracking\n\n"
+            f"- Timestamp (UTC): `{timestamp}`\n"
+            f"- Tracking hash: `{tracking_hash}`\n\n"
+            "Credentials, hosts, cookies, tokens, and response bodies are not included.\n",
             encoding="utf-8",
         )
 

@@ -1,8 +1,8 @@
-"""Bounded browser-session models for a loopback QA range.
+"""Bounded browser-session models for an authorized web validation range.
 
 Despite the historical module name, this implementation intentionally does not
-hide automation, spoof fingerprints, bypass access controls, or contact remote
-hosts.  A concrete browser adapter may translate the returned configuration to
+hide automation, spoof fingerprints, or bypass access controls. A concrete
+browser adapter may translate the returned configuration to
 Playwright/Selenium while preserving these invariants.
 """
 
@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlsplit
 
 MAX_ATTEMPTS = 500
 ALLOWED_ROLES = frozenset({"standard_user", "admin_test"})
@@ -46,12 +46,19 @@ class PipelineStatus(str, Enum):
     HALTED = "HALTED"
 
 
-def _loopback_url(value: str, label: str) -> str:
-    parsed = urlparse(value)
-    if parsed.scheme not in {"http", "https"} or parsed.hostname != "127.0.0.1":
-        raise ConfigurationError(f"{label} must be an http(s) URL on literal 127.0.0.1")
+def validate_public_url(value: str, label: str = "URL") -> str:
+    """Return a canonical, absolute HTTP(S) URL suitable for campaign scope."""
+    if not isinstance(value, str) or not value or any(char.isspace() for char in value):
+        raise ConfigurationError(f"{label} must be a non-empty URL without whitespace")
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ConfigurationError(f"{label} must be an absolute http(s) URL with a host")
     if parsed.username or parsed.password or parsed.fragment:
         raise ConfigurationError(f"{label} must not contain userinfo or a fragment")
+    try:
+        parsed.port
+    except ValueError as error:
+        raise ConfigurationError(f"{label} contains an invalid port") from error
     return value
 
 
@@ -69,7 +76,7 @@ class CampaignScope:
 
 
 class AuthorizationScenarioAdapter:
-    """Load either exact campaign shape and enforce loopback/same-origin scope."""
+    """Load either exact campaign shape and enforce same-origin scope."""
 
     ZERO_KEYS = {"target_scope_url"}
     AUTH_KEYS = ZERO_KEYS | {"username", "password", "auth_entry_route", "role_profile"}
@@ -84,7 +91,7 @@ class AuthorizationScenarioAdapter:
     def from_payload(cls, payload: Mapping[str, Any]) -> CampaignScope:
         if not isinstance(payload, Mapping) or set(payload) not in {frozenset(cls.ZERO_KEYS), frozenset(cls.AUTH_KEYS)}:
             raise ConfigurationError("campaign_scope.json must use exactly one documented structure")
-        target = _loopback_url(payload["target_scope_url"], "target_scope_url")
+        target = validate_public_url(payload["target_scope_url"], "target_scope_url")
         if set(payload) == cls.ZERO_KEYS:
             return CampaignScope(target)
         for key in ("username", "password", "auth_entry_route", "role_profile"):
@@ -92,8 +99,8 @@ class AuthorizationScenarioAdapter:
                 raise ConfigurationError(f"{key} must be a non-empty string")
         if payload["role_profile"] not in ALLOWED_ROLES:
             raise ConfigurationError("role_profile is not supported")
-        auth_url = _loopback_url(urljoin(target, payload["auth_entry_route"]), "auth_entry_route")
-        if urlparse(auth_url).netloc != urlparse(target).netloc:
+        auth_url = validate_public_url(urljoin(target, payload["auth_entry_route"]), "auth_entry_route")
+        if urlsplit(auth_url).netloc != urlsplit(target).netloc:
             raise ConfigurationError("auth_entry_route must have the target's origin")
         return CampaignScope(target, payload["username"], payload["password"], auth_url, payload["role_profile"])
 
@@ -105,7 +112,7 @@ class ProxyConfiguration:
     server: str
 
     def __post_init__(self) -> None:
-        _loopback_url(self.server, "proxy server")
+        validate_public_url(self.server, "proxy server")
 
 
 @dataclass(frozen=True)
@@ -115,6 +122,8 @@ class BrowserConfiguration:
     proxies: tuple[ProxyConfiguration, ...] = ()
     automation_disclosed: bool = True
     fingerprint_randomization: bool = False
+    driver_binary: Path = Path("camofox/camofox")
+    communication_endpoint: str = "http://localhost:9377"
 
     def __post_init__(self) -> None:
         width, height = self.viewport
@@ -122,6 +131,9 @@ class BrowserConfiguration:
             raise ConfigurationError("viewport is outside the QA desktop bounds")
         if not self.automation_disclosed or self.fingerprint_randomization:
             raise ConfigurationError("automation disclosure cannot be hidden and fingerprints cannot be spoofed")
+        endpoint = urlsplit(validate_public_url(self.communication_endpoint, "browser endpoint"))
+        if endpoint.hostname != "localhost" or endpoint.port != 9377:
+            raise ConfigurationError("browser endpoint must be Camofox at http://localhost:9377")
 
 
 async def simulate_human_delay(
@@ -172,6 +184,9 @@ class HardenedBrowserRunner:
             "automation_disclosed": True,
             "cdp_evasion_scripts": [],
             "fingerprint_randomization": False,
+            "driver_binary": str(self.config.driver_binary),
+            "communication_endpoint": self.config.communication_endpoint,
+            "human_delay_seconds": {"minimum": 3.0, "maximum": 15.0},
         }
 
     async def halt(self) -> None:

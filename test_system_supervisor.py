@@ -10,10 +10,14 @@ from system_supervisor import (
     SystemPauseEvent,
     SystemSupervisor,
     parse_live_command,
+    validate_target_url,
 )
 
 
 class LiveCommandTests(unittest.TestCase):
+    def test_public_campaign_url_is_accepted(self):
+        self.assertEqual(validate_target_url("https://cloud.example/app"), "https://cloud.example/app")
+
     def test_parser_accepts_only_documented_commands(self):
         self.assertEqual(parse_live_command("PAUSE").name, "PAUSE")
         self.assertEqual(parse_live_command("CANCEL").name, "CANCEL")

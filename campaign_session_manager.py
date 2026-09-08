@@ -14,7 +14,7 @@ import mmap
 import os
 import stat
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -24,6 +24,7 @@ from enterprise_stealth_range import (
     AuthorizationScenarioAdapter,
     CampaignScope,
     ConfigurationError,
+    simulate_human_delay,
 )
 
 SESSION_CORE = Path("/dev/shm/session_core")
@@ -161,10 +162,12 @@ class CampaignSessionManager:
         runner: SessionBrowserRunner,
         store: VolatileSessionStore | None = None,
         logger: Callable[[str], None] | None = None,
+        pacer: Callable[[], Awaitable[float]] = simulate_human_delay,
     ) -> None:
         self.runner = runner
         self.store = store or VolatileSessionStore()
         self.logger = logger or print
+        self.pacer = pacer
 
     @classmethod
     def load_scope(cls, path: str | Path = "campaign_scope.json") -> CampaignScope:
@@ -185,6 +188,8 @@ class CampaignSessionManager:
         return AuthorizationScenarioAdapter.from_payload(payload)
 
     async def ingest(self, scope: CampaignScope) -> SessionIngestionResult:
+        # Apply bounded, randomized network pacing to every local or wide-area route.
+        await self.pacer()
         if scope.username is None:
             self.logger("EXECUTION_MODE: EXTERNAL_PERIMETER_AUDIT")
             await self.runner.run_unauthenticated(scope.target_scope_url)
