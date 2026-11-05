@@ -11,6 +11,17 @@ authorization. Status updates are descriptive only. All registry results and
 queries are ordered deterministically, and invalid or missing records raise
 structured `ContractError` subclasses.
 
+## Static capability verification
+
+`capability_verification.py` statically validates contract completeness, supported
+capability/task mappings, known permission labels, the read-only adapter shape,
+and source references (including parseability and a SHA-256 evidence digest).
+`VERIFIED` means these metadata/interface checks passed only; it does not mean an
+agent ran successfully. Execution readiness is reported separately and remains
+false without a command-capable integration. Missing integrations are described
+as unavailable; unresolved permissions or source references remain unknown.
+The JSON report is serializable and grants no permissions.
+
 ## Campaign state machine and immutable approval binding
 
 Phase 1 is a dependency-free deterministic domain model. It performs no worker,
