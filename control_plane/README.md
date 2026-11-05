@@ -1,5 +1,17 @@
 # Control-plane domain modules
 
+## Mission selection and planning
+
+`mission_planning.py` converts the committed Brain `MissionDefinition` public
+JSON contract into a narrow mission reference (schema version 1), then matches
+only declared capabilities and task types against the metadata registry. Ranking
+is deterministic and exposes scores, evidence-based rationale, and rejection
+reasons. Plans and delegation proposals are declarative only: proposed agents
+are not executed, delegation is not authorized, and existing agents are never
+represented as execution-ready without an explicit command-capable integration
+and separately satisfied permissions. The current discovered agents therefore
+produce proposed plans with execution unavailable.
+
 ## Agent contracts and capability registry
 
 `agent_contracts.py` contains immutable, validated descriptions for specialist
