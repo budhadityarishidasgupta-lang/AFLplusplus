@@ -44,6 +44,7 @@ def classify_intent(text: str) -> Route:
     lesson_question_field = bool(re.search(
         r'(?im)^\s*(?:scenario summary|emotional context|observed facts|assumptions(?: or uncertainties)?|'
         r'corrective principle|recommended response pattern)\s*:', body))
+    fields = extract_lesson_fields(body)
     if lesson_question_field:
         # These labels are content in a structured submission, not routing cues.
         explicit_analysis_request = bool(re.search(
@@ -53,7 +54,7 @@ def classify_intent(text: str) -> Route:
     # a question-like phrase.
     awareness = bool(re.search(
         r'\b(which agents do you know|what agents do you know|what agents are there|list (?:the )?agents|'
-        r'what agents have you identified|what have you learned about (?:your|my) agents\b|'
+        r'what agents have you identified|what have you learned about (?:your|my|the) agent(?:s)?\b|'
         r'what do you understand about (?:your|my) agents|'
         r'tell me what agents you know|'
         r'what (?:can|capabilities can) (?:my )?agents do|what are (?:my )?agents capable of|'
@@ -64,6 +65,30 @@ def classify_intent(text: str) -> Route:
         r'missing capabilities|what is missing)\b', folded))
     if awareness and not negated_training:
         return Route('agent_awareness', 'explicit', 'Read-only question about discovered agent capabilities.')
+
+    # Explicit objectives are distinguished from factual questions before the
+    # general fallback. Mission parsing itself remains a separate service.
+    from .mission_intelligence import classify_mission_intent
+    mission_kind = classify_mission_intent(body)
+    explicit_goal = bool(re.search(
+        r'\b(please|i need|i want|help me|my goal|my objective|plan|design|organize|prepare|build|create|develop|implement|migrate|upgrade|set up|configure|diagnose|troubleshoot|audit|assess)\b',
+        folded) or (mission_kind == 'information_gathering' and re.match(
+            r'^(?:research|investigate|compare|evaluate|recommend|find|identify|look up)\b', folded)))
+    research_in_situational_context = bool(
+        re.search(r'\b(current|currently|recent|recently|latest|news|research|source|sources|evidence|study|studies|statistics|policy|policies|law|laws|regulation|regulations)\b', folded)
+        and re.search(r'\b(i feel|i am worried|i\'m worried|my friend|my colleague|conversation)\b', folded))
+    action_planning_language = bool(re.search(r'\b(plan|draft|prepare|organize)\b', folded))
+    non_explicit_information_request = mission_kind == 'information_gathering' and not re.search(
+        r'\b(please|i need|i want|help me|my goal|my objective|research|investigate|compare|evaluate|recommend|find|identify|look up)\b',
+        folded)
+    if (mission_kind != 'ordinary' and explicit_goal and not research_in_situational_context
+            and not action_planning_language and not non_explicit_information_request
+            and not re.search(r'\bdo not\b', folded)
+            and not re.search(
+                r'\b(approved lessons|what do you remember|recall|i want to teach|teach you|training lesson|'
+                r'do not|don.t|dont|never)\b', folded)
+            and not lesson_question_field and not fields and not explicit_analysis_request):
+        return Route('mission', 'explicit', f'Explicit {mission_kind.replace("_", " ")} objective.')
 
     recall = bool(re.search(
         r'\b(what do you remember|search approved memory|recall|what did i teach you|'
@@ -83,7 +108,6 @@ def classify_intent(text: str) -> Route:
 
     explicit_structured_submission = bool(re.search(
         r'\b(submit as a lesson|structured lesson submission|lesson fields submission)\b', folded))
-    fields = extract_lesson_fields(body)
     explicit_readonly_analysis = explicit_analysis_request and (
         negated_training or (not explicit_structured_submission and not fields and not lesson_question_field))
     if explicit_readonly_analysis:

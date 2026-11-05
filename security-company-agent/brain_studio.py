@@ -1535,6 +1535,13 @@ def _lesson_editor(message, pending):
 
 def _handle_message(user_text, session_id, history_messages, profile, model_config, configuration_error):
     route = conversation.classify_intent(user_text)
+    if (route.intent == 'mission' and route.confidence == 'explicit'
+            and _research_relevant(user_text)
+            and not re.search(
+                r"\b(please|i need|i want|help me|my goal|my objective|research|investigate|compare|evaluate|recommend|find|identify|look up|plan|design|organize|prepare|build|create|develop|implement|migrate|upgrade|set up|configure|diagnose|troubleshoot|audit|assess)\b",
+                user_text, re.I)):
+        route = conversation.Route('emotional_reasoning', 'default',
+                                   'Terse research context remains in the existing conversation flow.')
     persisted_pending = conversation.load_lesson_state(session_id, data_dir=studio.DATA, db_path=studio.DB)
     # Never let an incomplete draft capture a separate request. Only an explicit
     # training signal (or a labeled field update) continues the workflow.
@@ -1668,6 +1675,45 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
             conversation.save_lesson_state(session_id, None, data_dir=studio.DATA, db_path=studio.DB)
             if st.session_state.get('pending_lesson', {}).get('conversation_id') == session_id:
                 st.session_state.pending_lesson = None
+        return
+    if route.intent == 'mission' and route.confidence == 'explicit' and not (
+            _research_relevant(user_text)
+            and re.search(r"\b(i feel|i am worried|i'm worried|my friend|my colleague|conversation)\b", user_text, re.I)):
+        prior_user_mission = any(
+            message.get('role') == 'user' and message.get('content') == user_text
+            and message.get('message_type') == 'mission' for message in history_messages)
+        if _research_relevant(user_text) and not re.search(
+                r"\b(please|i need|i want|help me|my goal|my objective|research|investigate|compare|evaluate|recommend|find|identify|look up|plan|design|organize|prepare|build|create|develop|implement|migrate|upgrade|set up|configure|diagnose|troubleshoot|audit|assess)\b",
+                user_text, re.I):
+            prior_user_mission = False
+        prior_assistant_mission = any(
+            message.get('role') == 'assistant' and message.get('message_type') == 'mission'
+            and any(previous.get('role') == 'user' and previous.get('content') == user_text
+                    and previous.get('message_type') == 'mission' for previous in history_messages[:index])
+            for index, message in enumerate(history_messages))
+        if prior_user_mission and prior_assistant_mission:
+            return
+        if st.session_state.get('studio_inference') == 'Offline demonstration':
+            _save_response(session_id, 'Mission planning is unavailable in Offline demonstration mode. No mission was interpreted, and nothing was sent or executed.', 'mission_unavailable')
+            return
+        from brain_core import agent_awareness, mission_intelligence
+        try:
+            capability_report = agent_awareness.read_capability_report(_capability_report_path())
+        except (agent_awareness.CapabilityReportError, OSError, ValueError):
+            capability_report = None
+        mission = mission_intelligence.define_mission(user_text, capability_report=capability_report)
+        if mission is None:
+            _save_response(session_id, 'I can answer that as a normal conversation. What outcome would you like help with?', 'general')
+            return
+        store = st.session_state.setdefault('_mission_state_store', mission_intelligence.MissionStateStore())
+        prior = store.get(session_id)
+        if prior is not None and prior.original_objective == mission.original_objective:
+            mission = prior
+        else:
+            store.save(session_id, mission)
+        summary = mission_intelligence.summarize_mission(mission)
+        st.info(summary)
+        _save_response(session_id, summary, 'mission')
         return
     if route.intent == 'agent_awareness':
         from brain_core import agent_awareness
@@ -1876,6 +1922,9 @@ def render_conversation(profile, ready, model_config, configuration_error):
                 st.session_state.conversation_id = conversation.create_session(data_dir=studio.DATA, db_path=studio.DB)
                 st.session_state.pending_lesson = None
                 conversation.save_lesson_state(session_id, None, data_dir=studio.DATA, db_path=studio.DB)
+                mission_store = st.session_state.get('_mission_state_store')
+                if mission_store is not None:
+                    mission_store.clear(session_id)
                 st.session_state.conversation_selector = st.session_state.conversation_id
                 st.rerun()
     session_id = st.session_state.conversation_id

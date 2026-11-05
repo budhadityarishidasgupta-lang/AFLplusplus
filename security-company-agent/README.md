@@ -56,3 +56,11 @@ This is a Git workflow scaffold, **not** a completed migration of existing local
 ## Confidentiality
 
 Do not commit local state, secrets, personal training histories, passwords or target campaign data. Check `git status` before each checkpoint. Git ignores only prevent untracked file additions; remove already tracked sensitive files from Git's index separately if discovered.
+
+## Mission interpretation
+
+Sovereign Brain classifies explicit research, planning, and action objectives separately from ordinary questions. SB-35 creates a validated, session-scoped mission definition with intended outcome, reviewable success criteria, constraints, capability gaps, dependencies, risk, authorization requirements, readiness, and status. Mission interpretation is plan-only: it does not call providers, gather sources, assign agents, execute actions, or write approved memory. Missing hardware limits, evidence constraints, and unsupported capabilities remain visible. External actions require explicit approval and are not carried out by mission planning.
+
+Mission definitions are held in active Streamlit session state, isolated by conversation. They are not automatically persisted as personality or approved lessons. The existing model and research routes remain separately authorized and are not invoked by the mission planner.
+
+The mission planner consumes a validated report and does not alter the Agent Orchestration checkout, invoke agents, or update capability permissions.
