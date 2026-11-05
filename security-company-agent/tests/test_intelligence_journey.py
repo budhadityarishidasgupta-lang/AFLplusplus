@@ -23,8 +23,9 @@ class IntelligenceJourneyTests(unittest.TestCase):
             return selection
         return IntelligenceJourneyController(local_runner=runner, selector=selector)
 
-    def test_local_success_is_terminal_and_retains_original_request(self):
-        local = Mock(return_value={'status': 'success'})
+    def test_local_success_is_terminal_and_retains_original_request_and_result(self):
+        local_result = {'status': 'success', 'conversational_response': 'Synthetic validated Local answer.'}
+        local = Mock(return_value=local_result)
         selection = ProviderSelection(ProviderID.LOCAL_OLLAMA, SelectionReason.LOCAL_AVAILABLE)
         journey = self._controller(selection, local).start(self.REQUEST)
         self.assertEqual(journey.request, self.REQUEST)
@@ -32,6 +33,7 @@ class IntelligenceJourneyTests(unittest.TestCase):
         self.assertEqual(journey.state, FallbackState.SUCCESS)
         self.assertEqual(journey.attempted, (ProviderID.LOCAL_OLLAMA,))
         self.assertIsNone(journey.current_provider)
+        self.assertIs(journey.result, local_result)
         local.assert_called_once_with(self.REQUEST)
 
     def test_local_failure_advances_internally_to_openai_approval(self):

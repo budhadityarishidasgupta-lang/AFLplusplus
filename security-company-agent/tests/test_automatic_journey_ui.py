@@ -56,11 +56,22 @@ class AutomaticJourneyUITests(unittest.TestCase):
         text = 'I feel worried after a difficult conversation with my colleague.'
         structured = {'conversational_response': 'Synthetic validated local response.',
                       'narrative': 'Synthetic narrative.'}
-        result = InferenceResult(ProviderID.LOCAL_OLLAMA, 'local-test', '{}', structured,
-                                 'success', None, .01, None, None, None, None, True, False)
-        cid, profile, local, turn = self._setup_journey(text, local_result=result)
+        local_result = {
+            '_trainer_pending': True,
+            '_validation': {'schema_passed': True, 'cognitive_checks_passed': True},
+            '_provenance': {'source': 'local_model', 'model': 'local-test'},
+            '_intelligence_claims': [],
+            'conversational_response': 'Synthetic validated local response.',
+            'narrative': 'Synthetic narrative.',
+            'structured': structured,
+            'status': 'success',
+            'provider': ProviderID.LOCAL_OLLAMA,
+            'model': 'local-test',
+        }
+        cid, profile, local, turn = self._setup_journey(text, local_result=local_result)
         self.assertIsNotNone(turn)
         self.assertEqual(turn.local_state, 'complete')
+        self.assertIs(turn.local_result, local_result)
         self.assertEqual(local.call_count, 1)
         self.assertNotIn((cid, 'openai_cloud'), app_module.st.session_state.get(
             '_cloud_services_by_conversation', {}))
@@ -68,6 +79,7 @@ class AutomaticJourneyUITests(unittest.TestCase):
         rows = conversation.load_messages(cid, data_dir=self.fixture.paths['data_dir'],
                                           db_path=self.fixture.paths['db_path'])
         self.assertEqual(sum(item['role'] == 'assistant' for item in rows), 1)
+        self.assertEqual(rows[-1]['content'], 'Synthetic validated local response.')
         app_module._start_automatic_journey(text, cid, profile, Mock(local=True))
         self.assertEqual(local.call_count, 1)
         rows = conversation.load_messages(cid, data_dir=self.fixture.paths['data_dir'],

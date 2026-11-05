@@ -69,7 +69,7 @@ class IntelligenceJourneyController:
                 selection=selection, state=FallbackState.SUCCESS,
                 provider=ProviderID.LOCAL_OLLAMA, attempted=attempted)
             return IntelligenceJourney(request, selection, transition.state,
-                                       transition.attempted, None, None)
+                                       transition.attempted, None, None, result)
 
         # SB-05 owns recording the failed Local attempt from the prior history.
         fallback_selection = self._selector(
