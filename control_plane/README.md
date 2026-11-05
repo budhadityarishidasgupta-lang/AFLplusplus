@@ -1,4 +1,17 @@
-# Campaign state machine and immutable approval binding
+# Control-plane domain modules
+
+## Agent contracts and capability registry
+
+`agent_contracts.py` contains immutable, validated descriptions for specialist
+agents and requested tasks, a metadata-only registry, the capability knowledge
+statuses, and a minimal `AgentAdapter` protocol. It imports no legacy agent
+modules, has no discovery-by-import behavior, and exposes no execution method.
+Registration defaults to `discovered`; it never grants execution readiness or
+authorization. Status updates are descriptive only. All registry results and
+queries are ordered deterministically, and invalid or missing records raise
+structured `ContractError` subclasses.
+
+## Campaign state machine and immutable approval binding
 
 Phase 1 is a dependency-free deterministic domain model. It performs no worker,
 AFL++, shell, network, persistence, LLM, or OpenClaw operations.
