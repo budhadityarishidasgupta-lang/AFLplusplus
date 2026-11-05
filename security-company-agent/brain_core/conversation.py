@@ -51,6 +51,20 @@ def classify_intent(text: str) -> Route:
     # The teaching lead-in only applies to the message that starts the workflow;
     # later labeled submissions remain training even if lesson content contains
     # a question-like phrase.
+    awareness = bool(re.search(
+        r'\b(which agents do you know|what agents do you know|what agents are there|list (?:the )?agents|'
+        r'what agents have you identified|what have you learned about (?:your|my) agents\b|'
+        r'what do you understand about (?:your|my) agents|'
+        r'tell me what agents you know|'
+        r'what (?:can|capabilities can) (?:my )?agents do|what are (?:my )?agents capable of|'
+        r'what can my agents do|can you command|'
+        r'command (?:the )?.*agents|run (?:the )?.*agents|execute (?:the )?.*agents|'
+        r'which capabilities are missing|what capabilities are missing|what capabilities are still missing|'
+        r'which agents or capabilities are missing|what agents or capabilities are missing|'
+        r'missing capabilities|what is missing)\b', folded))
+    if awareness and not negated_training:
+        return Route('agent_awareness', 'explicit', 'Read-only question about discovered agent capabilities.')
+
     recall = bool(re.search(
         r'\b(what do you remember|search approved memory|recall|what did i teach you|'
         r'what have i taught you|show (my )?approved lessons|retrieve (approved )?memory|'
@@ -301,6 +315,16 @@ def delete_session(conversation_id, *, confirmed=False, data_dir=None, db_path=N
         changed = db.execute('DELETE FROM conversations WHERE conversation_id=?', (conversation_id,)).rowcount
         if not changed:
             raise ValueError('Conversation does not exist.')
+
+
+def respond_agent_awareness(text, report):
+    """Return a validated, read-only answer about declared agent capabilities."""
+    from .agent_awareness import answer_agent_question
+    try:
+        answer = answer_agent_question(text, report)
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        return 'I cannot safely answer about agent capabilities because the capability report is invalid.'
+    return answer or 'I can share what the verified capability report says if you ask about known agents, their capabilities, or command readiness.'
 
 
 def respond_general(text, profile):

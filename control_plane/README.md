@@ -20,7 +20,10 @@ and source references (including parseability and a SHA-256 evidence digest).
 agent ran successfully. Execution readiness is reported separately and remains
 false without a command-capable integration. Missing integrations are described
 as unavailable; unresolved permissions or source references remain unknown.
-The JSON report is serializable and grants no permissions.
+The JSON report is serializable and grants no permissions. Reports use
+`schema_version: 1` and include an `unsupported_capabilities` list consumed by
+the Brain's strict read-only adapter. `capability_states` remains authoritative
+for per-capability verification state.
 
 ## Campaign state machine and immutable approval binding
 
@@ -81,4 +84,3 @@ not available in the local clone. Therefore no pre-existing implementation
 could be reviewed in place. This minimal phase-1 model documents the lifecycle
 and constraints it implements; this absence should be reconciled against the
 intended upstream design before Phase 2 begins.
-

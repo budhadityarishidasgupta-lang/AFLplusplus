@@ -272,7 +272,9 @@ def verification_report(
     verifier = CapabilityVerifier(workspace)
     reports = verifier.verify_all(discovery)
     return {
+        "schema_version": 1,
         "agents": [report.to_dict() for report in reports],
+        "unsupported_capabilities": [],
         "execution_verified": False,
         "execution_note": "Contract verification is static metadata inspection only; no agent has been executed.",
         "permissions_granted": False,

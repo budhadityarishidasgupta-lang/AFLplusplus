@@ -21,8 +21,9 @@ class CandidateLearningReviewUITests(unittest.TestCase):
         self.fixture.app.run()
         self.app = self.fixture.app
         self.cid = self.app.session_state['conversation_id']
+        session_state_type = type('SessionStateFixture', (dict,), {'get': dict.get})
         self.mock_values = {
-            'session_state': self.app.session_state,
+            'session_state': session_state_type(dict(self.app.session_state)),
             'subheader': Mock(), 'caption': Mock(), 'markdown': Mock(), 'write': Mock(),
             'warning': Mock(), 'info': Mock(), 'success': Mock(), 'error': Mock(),
             'text_area': Mock(return_value='Ask for evidence before deciding.'),

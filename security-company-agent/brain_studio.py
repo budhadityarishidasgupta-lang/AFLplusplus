@@ -1435,7 +1435,7 @@ def _unused_render_admin_duplicate(profile, mode, remote_authorized, model, read
             transition = emotional_transition(result, st.session_state.get('studio_state') or state)
             try:
                 st.bar_chart(transition, x='Emotion', y=['Before', 'After'], horizontal=True, stack=False)
-                st.dataframe(transition, hide_index=True, width='stretch')
+                st.dataframe(transition, hide_index=True, use_container_width=True)
             except (ImportError, ModuleNotFoundError):
                 st.json(transition)
             st.json(result.get('_cognitive_context', {}))
@@ -1482,6 +1482,17 @@ def _unused_render_admin_duplicate(profile, mode, remote_authorized, model, read
                         st.error('Trainer feedback could not be saved.')
                 else:
                     st.warning('This result has no saved training turn to rate.')
+
+
+def _capability_report_path():
+    configured = os.environ.get('SOVEREIGN_BRAIN_CAPABILITY_REPORT')
+    if configured:
+        return Path(configured)
+    candidates = (
+        Path(__file__).resolve().parents[2] / 'agent-orchestration' / 'control_plane' / 'capability-report.json',
+        Path(__file__).resolve().parents[1] / 'agent-orchestration' / 'control_plane' / 'capability-report.json',
+    )
+    return next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
 
 
 def _save_response(session_id, text, message_type, status='not_applicable', *, lesson_id=None):
@@ -1657,6 +1668,37 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
             conversation.save_lesson_state(session_id, None, data_dir=studio.DATA, db_path=studio.DB)
             if st.session_state.get('pending_lesson', {}).get('conversation_id') == session_id:
                 st.session_state.pending_lesson = None
+        return
+    if route.intent == 'agent_awareness':
+        from brain_core import agent_awareness
+        try:
+            report_path = _capability_report_path()
+            report = agent_awareness.read_capability_report(report_path)
+            answer = conversation.respond_agent_awareness(user_text, report)
+        except (agent_awareness.CapabilityReportError, OSError, ValueError):
+            answer = 'I cannot safely answer about agent capabilities because no valid capability report is available.'
+        _save_response(session_id, answer, 'agent_awareness')
+        return
+    if route.intent == 'general':
+        from brain_core import agent_awareness
+        if st.session_state.get('studio_inference') != 'Offline demonstration':
+            try:
+                report_path = _capability_report_path()
+                report = agent_awareness.read_capability_report(report_path)
+                announcement_key = '_agent_awareness_announcement_fingerprint'
+                fingerprint = agent_awareness.report_fingerprint(report)
+                previous = st.session_state.get(announcement_key)
+                if previous != fingerprint:
+                    previous_report = st.session_state.get('_agent_awareness_report')
+                    announcement = agent_awareness.capability_change(previous_report, report)
+                    st.session_state[announcement_key] = fingerprint
+                    st.session_state['_agent_awareness_report'] = report
+                    if announcement:
+                        _save_response(session_id, announcement, 'agent_awareness_update')
+            except (agent_awareness.CapabilityReportError, OSError, ValueError):
+                pass
+        _run_general_answer(user_text, session_id, profile, model_config)
+        _render_cloud_approval(session_id)
         return
     if route.intent == 'memory_recall':
         found = lessons.retrieve(user_text, data_dir=studio.DATA, db_path=studio.DB)
@@ -2009,7 +2051,7 @@ def render_admin(profile, mode, remote_authorized, model, ready, configuration_e
             transition = emotional_transition(result, st.session_state.get('studio_state') or state)
             try:
                 st.bar_chart(transition, x='Emotion', y=['Before', 'After'], horizontal=True, stack=False)
-                st.dataframe(transition, hide_index=True, width='stretch')
+                st.dataframe(transition, hide_index=True, use_container_width=True)
             except (ImportError, ModuleNotFoundError):
                 st.json(transition)
             st.json(result.get('_cognitive_context', {}))

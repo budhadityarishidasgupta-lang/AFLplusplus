@@ -2,6 +2,19 @@
 
 This project lives under `security-company-agent/` in the AFLplusplus repository, without modifying the upstream AFL++ source tree.
 
+## Agent capability awareness
+
+Sovereign Brain reads only a validated, versioned JSON report from
+`SOVEREIGN_BRAIN_CAPABILITY_REPORT` (or the adjacent agent workspace's
+`control_plane/capability-report.json` by default). SB-34 adds a read-only
+adapter for the existing control-plane contract; it does not duplicate the
+registry or import agent code. Static verification, command readiness, and
+permission grants remain distinct. Reports are never authority to execute an
+agent. Proactive updates are saved in the active conversation only when a
+meaningful report change is detected, with rerun deduplication held in the
+Streamlit session state. Invalid reports fail closed, and private memory is not
+modified.
+
 ## Windows first-time setup
 
 **Important:** If `C:\SecurityCompanyAgent` contains any existing project files, do not clone into or replace it. First back up the entire directory and reconcile those files manually or with Codex. The clone command below is only for a **new empty directory**.
