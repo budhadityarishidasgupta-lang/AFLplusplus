@@ -29,7 +29,7 @@ class Step8LTests(unittest.TestCase):
         self.assertTrue(result['_validation']['schema_passed'])
         self.assertTrue(result['_validation']['cognitive_checks_passed'])
         response=result['conversational_response'].casefold()
-        self.assertIn('you described feeling fear',response)
+        self.assertIn('you described feeling anxious',response)
         self.assertNotIn('no longer values',response)
         self.assertIn('unknown',response)
 

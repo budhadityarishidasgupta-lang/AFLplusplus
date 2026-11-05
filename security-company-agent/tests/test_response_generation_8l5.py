@@ -81,9 +81,54 @@ class ResponseGeneration8L5Tests(unittest.TestCase):
         result['_provenance']['approved_lessons'] = [{'lesson_id': 'L5', 'source_type': 'human_supervised',
             'corrective_principle': 'Past emotional memories are not proof of another person’s intentions.'}]
         response = conversational_response(result)
-        self.assertIn('L5', response)
-        self.assertIn('human_supervised', response)
-        self.assertIn('guidance, not evidence', response)
+        self.assertIn('approved lesson offers this guidance', response)
+        self.assertIn('Past emotional memories are not proof', response)
+        self.assertNotIn('L5', response)
+        self.assertNotIn('human_supervised', response)
+
+    def test_lesson_uses_paragraph_without_technical_orchestration_terms(self):
+        result = validated_for('past_emotional_memory', dict(SCENARIOS)['past_emotional_memory'])
+        result['_provenance']['approved_lessons'] = [{'lesson_id': 'lesson-5-private-id',
+            'source_type': 'human_supervised',
+            'corrective_principle': 'Past emotional memories are not proof of another person’s intentions.'}]
+        response = conversational_response(result)
+        self.assertIn('\n\nAn approved lesson offers this guidance:', response)
+        self.assertNotIn('lesson-5-private-id', response)
+        self.assertNotIn('human_supervised', response)
+        self.assertNotIn('provenance', response.casefold())
+
+    def test_complete_and_fragment_triggers_are_natural(self):
+        scenario = dict(SCENARIOS)['silence_uncertainty']
+        result = validated_for('silence_uncertainty', scenario)
+        result['_stage_outputs']['understanding']['emotions'][0]['trigger'] = 'I feel anxious about not hearing back.'
+        complete = conversational_response(result)
+        self.assertIn('You described feeling anxious about not hearing back.', complete)
+        self.assertNotIn('feeling anxiety about I feel', complete.casefold())
+        result['_stage_outputs']['understanding']['emotions'][0]['trigger'] = 'not hearing back'
+        fragment = conversational_response(result)
+        self.assertIn('You described feeling caution about not hearing back.', fragment)
+        self.assertTrue(fragment.endswith('.'))
+
+    def test_duplicate_validation_and_rationale_are_not_repeated(self):
+        result = validated_for('silence_uncertainty', dict(SCENARIOS)['silence_uncertainty'])
+        result['_stage_outputs']['understanding']['assumptions'] = [
+            'The reason for the silence is unknown.', 'Silence alone does not establish rejection.']
+        result['_stage_outputs']['understanding']['emotions'][0]['trigger'] = 'I feel anxious about the delay.'
+        result['_stage_outputs']['final_decision']['rationale'] = 'The reason for the silence is unknown.'
+        response = conversational_response(result)
+        self.assertEqual(response.casefold().count('the reason for the silence is unknown'), 1)
+        self.assertIn('the reason for the silence is unknown', response.casefold())
+
+    def test_missing_optional_fields_do_not_create_broken_sentences(self):
+        result = validated_for('unknown_motives', dict(SCENARIOS)['unknown_motives'])
+        result['_stage_outputs']['understanding']['assumptions'] = []
+        result['_stage_outputs']['alternatives'] = {'alternatives': []}
+        result['_stage_outputs']['final_decision']['rationale'] = ''
+        response = conversational_response(result)
+        self.assertIn('One proportionate next step is to ask', response)
+        self.assertNotIn('What remains uncertain is .', response)
+        self.assertNotIn('This may .', response)
+        self.assertNotIn('lesson', response.casefold())
 
     def test_missing_fields_fail_closed(self):
         with self.assertRaises(ValueError):
@@ -94,7 +139,7 @@ class ResponseGeneration8L5Tests(unittest.TestCase):
         result = validated_for('jealousy_without_evidence', scenario)
         result['_stage_outputs']['understanding']['emotions'] = [{'label': 'jealousy', 'trigger': 'I feel jealous'}]
         response = conversational_response(result)
-        self.assertIn('jealousy', response.casefold())
+        self.assertIn('feeling jealous', response.casefold())
         self.assertNotIn('cheating', response.casefold())
         self.assertNotIn('trust', response.casefold())
 

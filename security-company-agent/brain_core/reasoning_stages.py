@@ -36,63 +36,96 @@ def _validate_assembled(data, scenario):
 
 
 def conversational_response(data):
-    """Render a validated internal analysis as natural user-facing conversation."""
+    """Render validated structured analysis as natural prose without adding claims."""
     from .reasoning_contract import from_validated_result
 
     contract = from_validated_result(data)
-    if not contract.scenario_facts or not contract.user_reported_emotions or not contract.uncertainties:
+    if not contract.scenario_facts or not contract.user_reported_emotions:
         raise ValueError('Validated response is missing required contract fields.')
 
-    def sentence(value):
-        text = str(value).strip().rstrip('.!? ')
-        return text if text else ''
+    def clean(value):
+        """Normalize supplied text without paraphrasing or creating new information."""
+        text = re.sub(r'\s+', ' ', str(value or '')).strip()
+        text = re.sub(r'\s+([,;:.!?])', r'\1', text)
+        return text
 
-    def action_phrase(value):
-        text = sentence(value)
+    def complete(value):
+        text = clean(value).rstrip(' .!?')
+        return text + '.' if text else ''
+
+    def lower_initial(value):
+        text = clean(value)
+        return text[:1].lower() + text[1:] if text else ''
+
+    def action_clause(value):
+        text = complete(value)
         for prefix in ('I will ', 'I would ', 'I can '):
             if text.casefold().startswith(prefix.casefold()):
-                return text[len(prefix):]
-        return text[0].lower() + text[1:] if text else ''
+                return text[len(prefix):-1].rstrip()
+        return text[:-1] if text else ''
 
-    parts = [f"From what you described, {sentence(contract.scenario_facts[0])}."]
+    def add_once(paragraph, candidate):
+        """Avoid restating validation or uncertainty already present in supplied text."""
+        candidate_text = clean(candidate).rstrip('.!?').casefold()
+        existing = clean(paragraph).rstrip('.!?').casefold()
+        if candidate_text and (candidate_text in existing or existing in candidate_text):
+            return paragraph
+        return paragraph + ' ' + complete(candidate)
+
+    fact = complete(contract.scenario_facts[0])
+    if not fact:
+        raise ValueError('Validated response is missing scenario facts.')
+    paragraph = 'From what you described, ' + lower_initial(fact)
+
     emotion = contract.user_reported_emotions[0]
-    label = str(emotion.get('label', '')).strip()
-    trigger = sentence(emotion.get('trigger', ''))
+    label = clean(emotion.get('label', ''))
+    trigger = clean(emotion.get('trigger', ''))
     if not label or not trigger:
         raise ValueError('Validated response is missing a grounded emotion.')
-    trigger = re.sub(r'^(I feel|I am|I\'m|I want|I do not want)\s+', '', trigger, flags=re.IGNORECASE)
-    parts.append(f"You described feeling {label} about {trigger[0].lower() + trigger[1:] if trigger else trigger}.")
-
-    uncertainty = sentence(contract.uncertainties[0])
-    if not uncertainty:
-        raise ValueError('Validated response is missing uncertainty context.')
-    if uncertainty.casefold().startswith('the reason'):
-        parts.append(f"What remains uncertain is {uncertainty[0].lower() + uncertainty[1:]}.")
+    # Triggers may already be complete emotional statements; avoid wrapping them
+    # in another "feeling ... about ..." clause.
+    feeling_match = re.match(r"^(I feel|you feel)\s+(.+)$", trigger, re.IGNORECASE)
+    if feeling_match:
+        validation = complete('You described feeling ' + lower_initial(feeling_match.group(2)))
+    elif re.match(r"^(I am|I'm|I want|I do not want|you are)\b", trigger, re.IGNORECASE):
+        validation = complete(trigger)
     else:
-        parts.append(f"What remains uncertain is that {uncertainty}.")
-    if contract.alternative_interpretations:
-        alternative = sentence(contract.alternative_interpretations[0])
-        if alternative and alternative.casefold() != uncertainty.casefold():
-            parts.append(f"Other possibilities to keep in mind: {alternative}.")
+        validation = complete(f'You described feeling {label} about {lower_initial(trigger)}')
+    paragraph = add_once(paragraph, validation)
 
-    chosen = action_phrase(contract.recommended_response)
-    if not chosen:
+    uncertainty = complete(contract.uncertainties[0]) if contract.uncertainties else ''
+    if uncertainty:
+        uncertainty_folded = uncertainty.rstrip('.!?').casefold()
+        rationale_text = complete((data.get('_stage_outputs') or {}).get('final_decision', {}).get('rationale', ''))
+        if uncertainty_folded in paragraph.rstrip('.!?').casefold() or uncertainty_folded in rationale_text.casefold():
+            uncertainty_sentence = ''
+        elif re.match(r'^(the reason|whether|if)\b', uncertainty, re.IGNORECASE):
+            uncertainty_sentence = 'What remains uncertain is ' + lower_initial(uncertainty)
+        elif re.match(r'^(it is unknown|it remains unclear|we do not know)\b', uncertainty, re.IGNORECASE):
+            uncertainty_sentence = uncertainty
+        else:
+            uncertainty_sentence = 'What remains uncertain is whether ' + lower_initial(uncertainty)
+        if uncertainty_sentence:
+            paragraph = add_once(paragraph, uncertainty_sentence)
+
+    action = action_clause(contract.recommended_response)
+    if not action:
         raise ValueError('Validated response is missing a recommendation.')
-    parts.append(f"One proportionate next step is to {chosen}.")
-    rationale = sentence(contract.potential_actions[0].get('consequence', '')) if contract.potential_actions else ''
-    final = sentence((data.get('_stage_outputs') or {}).get('final_decision', {}).get('rationale', ''))
-    if final:
-        parts.append(final[0].upper() + final[1:] + '.')
-    elif rationale:
-        parts.append(f"This may {rationale}.")
+    paragraph += ' One proportionate next step is to ' + lower_initial(action) + '.'
+
+    rationale = complete((data.get('_stage_outputs') or {}).get('final_decision', {}).get('rationale', ''))
+    if rationale and rationale.casefold() not in paragraph.casefold():
+        paragraph = add_once(paragraph, rationale)
+
+    paragraphs = [paragraph]
     if contract.approved_lessons:
         lesson = contract.approved_lessons[0]
-        principle = str(lesson.get('corrective_principle', '')).strip()
-        lesson_id = str(lesson.get('lesson_id', '')).strip()
-        source = str(lesson.get('source_type', '')).strip()
-        if principle and lesson_id and source:
-            parts.append(f"A relevant approved lesson (lesson {lesson_id}, source: {source}) offers this guidance, not evidence about anyone's motives: {sentence(principle)}.")
-    return ' '.join(parts)
+        principle = complete(lesson.get('corrective_principle', ''))
+        if principle:
+            # User-facing prose contains the approved principle, not internal IDs
+            # or provenance codes. Those remain available in inspection surfaces.
+            paragraphs.append('An approved lesson offers this guidance: ' + principle)
+    return '\n\n'.join(paragraphs)
 
 
 def _failed_alternative_field(criterion, raw, facts, scenario):
