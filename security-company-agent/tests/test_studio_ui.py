@@ -1,10 +1,13 @@
 """Streamlit UI regression tests, strictly offline with isolated temporary stores."""
 from contextlib import ExitStack
+from functools import wraps
 from pathlib import Path
+import hashlib
 import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -29,6 +32,18 @@ def sequential_routing(test):
 
 
 
+_STATE_INTEGRITY_TEST_LOCK = threading.Lock()
+
+
+def serialize_state_integrity_test(test):
+    """Avoid overlap with suite cases that temporarily patch shared module globals."""
+    @wraps(test)
+    def serialized(self, *args, **kwargs):
+        with _STATE_INTEGRITY_TEST_LOCK:
+            return test(self, *args, **kwargs)
+    return serialized
+
+
 class StudioUITests(unittest.TestCase):
     def setUp(self):
         self.context = ExitStack()
@@ -51,6 +66,11 @@ class StudioUITests(unittest.TestCase):
                                    (studio, 'DATA', self.paths['data_dir']),
                                    (studio, 'DB', self.paths['db_path'])):
             self.context.enter_context(patch.object(owner, key, value))
+        self.diagnostic_dir = self.root / 'diagnostics'
+        self.context.enter_context(patch.dict(os.environ, {
+            'BRAIN_DIAGNOSTIC_DIR': str(self.diagnostic_dir),
+            'BRAIN_DIAGNOSTIC_VERBOSITY': 'minimal',
+        }))
         self.context.enter_context(patch.object(model_api, 'local_inventory', return_value=[]))
         self.context.enter_context(patch.object(runtime_guard, 'available_memory_gib', return_value=0.8))
         self.context.enter_context(patch.object(app_module, 'installed_models', return_value=[]))
@@ -104,9 +124,7 @@ class StudioUITests(unittest.TestCase):
         self.assertEqual(list(app.exception), [])
         self.assertEqual(self.service_analyze.call_count, 1)
         self.assertIsNone(studio.inspect_turns(db_path=self.root / 'brain.sqlite3')[0]['rating'])
-        self.assertEqual(self.active_before,
-                         {path: (path.exists(), path.read_bytes() if path.is_file() else None)
-                          for path in self.active_paths})
+        self._assert_live_state_unchanged()
         fresh = self.fresh_app.run()
         self.assertEqual(list(fresh.exception), [])
         self.assertFalse((self.root / 'personality.json').exists())
@@ -127,10 +145,9 @@ class StudioUITests(unittest.TestCase):
         self.assertFalse(Path(trainer.HISTORY_PATH).exists())
         self.assertFalse(Path(personality.PROFILE_PATH).exists())
         self.assertTrue(Path(studio.DB).exists())
-        self.assertEqual(self.active_before,
-                         {path: (path.exists(), path.read_bytes() if path.is_file() else None)
-                          for path in self.active_paths})
+        self._assert_live_state_unchanged()
 
+    @serialize_state_integrity_test
     def test_model_output_error_is_friendly_and_retryable(self):
         from brain_core.model_api import ModelOutputError
         with patch('brain_core.service.analyze', side_effect=ModelOutputError('private validation detail')):
@@ -156,9 +173,26 @@ class StudioUITests(unittest.TestCase):
         self.assertFalse((self.root / 'state.json').exists())
         self.assertFalse((self.root / 'history.json').exists())
         self.assertTrue((self.root / 'brain.sqlite3').exists())
-        self.assertEqual(self.active_before,
-                         {path: (path.exists(), path.read_bytes() if path.is_file() else None)
-                          for path in self.active_paths})
+        self._assert_live_state_unchanged()
+
+    def _assert_live_state_unchanged(self):
+        after = {path: (path.exists(), path.read_bytes() if path.is_file() else None)
+                 for path in self.active_paths}
+        try:
+            self.assertEqual(self.active_before, after)
+        except AssertionError as error:
+            def describe(snapshot):
+                return {
+                    str(path): {
+                        'exists': exists,
+                        'bytes': len(content) if content is not None else None,
+                        'sha256': hashlib.sha256(content).hexdigest() if content is not None else None,
+                    }
+                    for path, (exists, content) in snapshot.items()
+                }
+            raise AssertionError(
+                f'{error}\nLive-state file metadata only (no contents):\n'
+                f'before={describe(self.active_before)!r}\nafter={describe(after)!r}') from None
 
     def test_missing_local_model_is_visible_and_prevents_inference(self):
         app = self.app.run()
