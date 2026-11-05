@@ -168,6 +168,12 @@ class CloudOrchestrationTests(unittest.TestCase):
                 error = caught.exception
                 self.assertEqual(error.diagnostic, 'request_execution')
                 self.assertEqual(error.substage, expected_substage)
+                if expected_substage == 'result_accounting':
+                    self.assertEqual(error.accounting_error_class, 'RuntimeError')
+                    self.assertEqual(error.lifecycle_status, 'pending')
+                    self.assertTrue(error.pending_event_exists)
+                    self.assertTrue(error.accounting_callback_invoked)
+                    self.assertRegex(error.accounting_operation_id, r'^[a-f0-9]{32}$')
                 from brain_studio import _safe_cloud_failure_diagnostic
                 rendered = repr(_safe_cloud_failure_diagnostic(error))
                 self.assertNotIn(secret, rendered)
@@ -180,6 +186,66 @@ class CloudOrchestrationTests(unittest.TestCase):
                     self.assertEqual(manager.events[0]['error_category'], 'execution_started')
                 elif manager.events[0]['error_category'] is not None:
                     self.assertEqual(manager.events[0]['error_category'], 'execution_failed')
+
+    def test_accounting_failure_diagnostics_capture_safe_lifecycle_state(self):
+        import brain_studio
+
+        secret = 'synthetic-private-key-or-prompt'
+        cases = (
+            ('missing', None, 'missing', False),
+            ('finalized', CloudApprovalRequired(secret), 'finalized', False),
+            ('unexpected', RuntimeError(secret), 'pending', True),
+        )
+        for label, failure, expected_state, expected_pending in cases:
+            with self.subTest(case=label):
+                manager = CloudApprovalManager()
+                result = InferenceResult(
+                    ProviderID.ALIBABA_QWEN_CLOUD, 'qwen-test', '{}', {'ok': True}, 'success',
+                    None, 0.01, 3, 2, 'synthetic-request', None, True, True)
+                provider = MockProvider(result=result)
+                if label == 'missing':
+                    def remove_pending(**kwargs):
+                        approval_id = kwargs['request'].approval_id
+                        manager._events.pop()
+                        manager._approvals.pop(approval_id, None)
+                        manager._used.add(approval_id)
+                        raise CloudApprovalRequired(secret)
+                    accountant = Mock(side_effect=remove_pending)
+                elif label == 'finalized':
+                    def finalize_then_fail(**kwargs):
+                        manager.record_result(kwargs['request'].approval_id, success=False,
+                                              error_category='already_finalized')
+                        raise failure
+                    accountant = Mock(side_effect=finalize_then_fail)
+                else:
+                    accountant = Mock(side_effect=failure)
+                service = CloudOrchestrator(
+                    consent=manager, payload_factory=lambda *args, **kwargs: (
+                        Settings(), ENDPOINT, PAYLOAD, {'type': 'object'}),
+                    provider_factory=Mock(return_value=provider), api_key=lambda: 'synthetic-key',
+                    provider_payload=lambda payload, request: payload,
+                    provider_fingerprint=lambda request, payload: 'mock-request-fingerprint',
+                    result_writer=Mock(), result_accountant=accountant)
+                request = service.prepare_fallback(
+                    user_text='synthetic accounting scenario', conversation_id='accounting-' + label,
+                    profile={'identity_name': 'Synthetic'}, approved_lessons=[],
+                    local_error=RuntimeError('controlled local failure'))
+                with self.assertRaises(CloudOrchestrationError) as caught:
+                    service.approve_and_execute(request=request, conversation_id=request.conversation_id)
+                error = caught.exception
+                self.assertEqual(error.substage, 'result_accounting')
+                self.assertIn(label, ('missing', 'finalized', 'unexpected'))
+                self.assertEqual(error.accounting_error_class,
+                                 'CloudApprovalRequired' if label in ('missing', 'finalized') else 'RuntimeError')
+                self.assertEqual(accountant.call_args.kwargs['accounting_operation_id'],
+                                 error.accounting_operation_id)
+                self.assertEqual(error.lifecycle_status, expected_state)
+                self.assertEqual(error.pending_event_exists, expected_pending)
+                self.assertTrue(error.accounting_callback_invoked)
+                self.assertRegex(error.accounting_operation_id, r'^[a-f0-9]{32}$')
+                self.assertEqual(accountant.call_count, 1)
+                self.assertNotIn(secret, repr((error.accounting_error_class, error.lifecycle_status,
+                                               error.pending_event_exists, error.accounting_operation_id)))
 
     def test_successful_adapter_result_accounting_and_writer_are_unchanged(self):
         request = self.prepare()
@@ -217,8 +283,11 @@ class CloudOrchestrationTests(unittest.TestCase):
             self.assertTrue(manager.events[0]['success'])
             self.assertEqual(manager.events[0]['input_tokens'], 3)
             self.assertEqual(manager.events[0]['output_tokens'], 2)
-            accountant.assert_called_once_with(
-                request=request, result=result, conversation_id='production-accountant')
+            accountant.assert_called_once()
+            self.assertEqual(accountant.call_args.kwargs['request'], request)
+            self.assertEqual(accountant.call_args.kwargs['result'], result)
+            self.assertEqual(accountant.call_args.kwargs['conversation_id'], 'production-accountant')
+            self.assertRegex(accountant.call_args.kwargs['accounting_operation_id'], r'^[a-f0-9]{32}$')
             with self.assertRaises(CloudOrchestrationError):
                 service.approve_and_execute(request=request, conversation_id='production-accountant')
             self.assertEqual(provider.calls, 1)

@@ -42,6 +42,8 @@ CLOUD_CONSENT = _DEFAULT_CLOUD_APPROVALS
 CLOUD_SERVICE_FACTORY = cloud_orchestration.CloudOrchestrator
 _CLOUD_FAILURE_CATEGORIES = cloud_orchestration.CloudOrchestrationError.DIAGNOSTICS
 _CLOUD_FAILURE_SUBSTAGES = cloud_orchestration.CloudOrchestrationError.SUBSTAGES
+_ACCOUNTING_ERROR_CLASSES = cloud_orchestration.CloudOrchestrationError.ACCOUNTING_ERROR_CLASSES
+_ACCOUNTING_LIFECYCLE_STATES = frozenset({'pending', 'finalized', 'missing', 'inconsistent', 'unknown'})
 CLOUD_PAYLOAD_FACTORY = None
 
 
@@ -52,6 +54,82 @@ def _safe_cloud_failure_diagnostic(error):
     stage = stage if isinstance(stage, str) and stage in _CLOUD_FAILURE_CATEGORIES else 'unknown'
     substage = substage if isinstance(substage, str) and substage in _CLOUD_FAILURE_SUBSTAGES else 'unknown'
     return stage, substage
+
+
+def _show_cloud_accounting_diagnostics():
+    """Render only the validated accounting metadata allowlist in Admin."""
+    diagnostic_dir = os.environ.get('BRAIN_DIAGNOSTIC_DIR')
+    directory = Path(diagnostic_dir) if diagnostic_dir else Path(os.getenv('TEMP', '.')) / 'sovereign-brain-diagnostics'
+    if not directory.is_absolute():
+        directory = Path(os.getenv('TEMP', '.')) / 'sovereign-brain-diagnostics'
+    records = []
+    if directory.is_dir():
+        for path in sorted(directory.glob('cloud-accounting-*.json'))[-20:]:
+            try:
+                item = json.loads(path.read_text(encoding='utf-8'))
+                if not isinstance(item, dict) or item.get('diagnostic_type') != 'cloud_accounting':
+                    continue
+                operation_id = item.get('operation_id')
+                error_class = item.get('error_class')
+                lifecycle = item.get('lifecycle_status')
+                pending = item.get('pending_event_exists')
+                records.append({
+                    'operation_id': operation_id if isinstance(operation_id, str)
+                    and re.fullmatch(r'[a-f0-9]{32}', operation_id) else 'unknown',
+                    'error_class': error_class if isinstance(error_class, str)
+                    and error_class in _ACCOUNTING_ERROR_CLASSES else 'OtherError',
+                    'pending_event_exists': pending if pending in (True, False, None) else None,
+                    'lifecycle_status': lifecycle if isinstance(lifecycle, str)
+                    and lifecycle in _ACCOUNTING_LIFECYCLE_STATES else 'unknown',
+                    'callback_invoked': item.get('callback_invoked') is True,
+                })
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+    if records:
+        st.caption('Cloud consent accounting diagnostics (safe categories only)')
+        st.json(records)
+
+
+def _write_cloud_accounting_diagnostic(error):
+    """Persist only fixed safe categories and lifecycle state for accounting failures."""
+    if not (getattr(error, 'diagnostic', None) == 'request_execution'
+            and getattr(error, 'substage', None) == 'result_accounting'):
+        return None
+    operation_id = getattr(error, 'accounting_operation_id', None)
+    if not isinstance(operation_id, str) or not re.fullmatch(r'[a-f0-9]{32}', operation_id):
+        return None
+    error_class = getattr(error, 'accounting_error_class', None)
+    if not isinstance(error_class, str) or error_class not in _ACCOUNTING_ERROR_CLASSES:
+        error_class = 'OtherError'
+    lifecycle = getattr(error, 'lifecycle_status', None)
+    if not isinstance(lifecycle, str) or lifecycle not in _ACCOUNTING_LIFECYCLE_STATES:
+        lifecycle = 'unknown'
+    pending = getattr(error, 'pending_event_exists', None)
+    if pending not in (True, False, None):
+        pending = None
+    callback_invoked = getattr(error, 'accounting_callback_invoked', False) is True
+    status = 'recorded'
+    try:
+        diagnostic_dir = os.environ.get('BRAIN_DIAGNOSTIC_DIR')
+        directory = Path(diagnostic_dir) if diagnostic_dir else Path(os.getenv('TEMP', '.')) / 'sovereign-brain-diagnostics'
+        if not directory.is_absolute():
+            directory = Path(os.getenv('TEMP', '.')) / 'sovereign-brain-diagnostics'
+        directory.mkdir(parents=True, exist_ok=True)
+        record = {
+            'diagnostic_type': 'cloud_accounting',
+            'operation_id': operation_id,
+            'error_class': error_class,
+            'pending_event_exists': pending,
+            'lifecycle_status': lifecycle,
+            'callback_invoked': callback_invoked,
+        }
+        (directory / f'cloud-accounting-{operation_id}.json').write_text(
+            json.dumps(record, sort_keys=True), encoding='utf-8')
+    except (OSError, TypeError, ValueError):
+        status = 'write_failed'
+    return {'status': status, 'operation_id': operation_id, 'error_class': error_class,
+            'pending_event_exists': pending, 'lifecycle_status': lifecycle,
+            'callback_invoked': callback_invoked}
 
 CLOUD_PROVIDER_FACTORY = AlibabaQwenProvider
 CLOUD_API_KEY = lambda: os.getenv('DASHSCOPE_API_KEY', '')
@@ -613,7 +691,7 @@ def _cloud_result_writer(session_id, result, approved_lessons=()):
         pass
 
 
-def _account_cloud_result(*, request, result, conversation_id):
+def _account_cloud_result(*, request, result, conversation_id, accounting_operation_id=None):
     CLOUD_CONSENT.record_result(
         request.approval_id, success=result.status == 'success',
         input_tokens=getattr(result, 'input_tokens', None),
@@ -920,6 +998,15 @@ def _render_cloud_approval(session_id):
         except cloud_orchestration.CloudOrchestrationError as error:
             diagnostic, substage = _safe_cloud_failure_diagnostic(error)
             st.error(f'Cloud request failed safely · stage: {diagnostic} · substage: {substage}. No automatic retry was attempted.')
+            accounting_diagnostic = _write_cloud_accounting_diagnostic(error)
+            if accounting_diagnostic is not None:
+                st.caption('Safe accounting state · '
+                           f"status: {accounting_diagnostic['status']} · "
+                           f"error class: {accounting_diagnostic['error_class']} · "
+                           f"pending event: {accounting_diagnostic['pending_event_exists']} · "
+                           f"lifecycle: {accounting_diagnostic['lifecycle_status']} · "
+                           f"callback invoked: {accounting_diagnostic['callback_invoked']} · "
+                           f"operation: {accounting_diagnostic['operation_id']}")
     if right.button('Decline cloud; keep request local', key='decline_cloud_once'):
         if cloud_service.decline_fallback(request=request, conversation_id=session_id):
             general_store = st.session_state.get('_general_journey_store', {})
@@ -1285,6 +1372,7 @@ def _unused_render_admin_duplicate(profile, mode, remote_authorized, model, read
                     st.caption('A diagnostic record could not be read.')
         else:
             st.caption('No configured local diagnostic directory was found.')
+        _show_cloud_accounting_diagnostics()
     with st.expander('Legacy trainer workflow', expanded=False):
         st.session_state.setdefault('admin_result_review', None)
         scenario = st.text_area('Situation', height=135, max_chars=8000)
@@ -1858,6 +1946,7 @@ def render_admin(profile, mode, remote_authorized, model, ready, configuration_e
                     st.caption('A diagnostic record could not be read.')
         else:
             st.caption('No configured local diagnostic directory was found.')
+        _show_cloud_accounting_diagnostics()
     with st.expander('Legacy trainer workflow', expanded=False):
         st.session_state.setdefault('admin_result_review', None)
         scenario = st.text_area('Situation', height=135, max_chars=8000)

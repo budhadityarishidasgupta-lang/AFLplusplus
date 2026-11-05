@@ -133,6 +133,24 @@ class CloudApprovalManager:
                     day = time.strftime('%Y-%m-%d', time.gmtime())
                     self._daily_spend[day] = self._daily_spend.get(day, 0.0) + cost
 
+    def accounting_state(self, approval_id):
+        """Return safe lifecycle state without exposing the authorization reference."""
+        with self._lock:
+            matching = [item for item in self._events
+                        if item.get('authorization_reference') == approval_id]
+            if not matching:
+                return {'pending_event_exists': False, 'lifecycle_status': 'missing'}
+            event = matching[-1]
+            finalized = event.get('_finalized') is True
+            pending_approval = approval_id in self._approvals
+            if finalized:
+                status = 'finalized'
+            elif pending_approval:
+                status = 'pending'
+            else:
+                status = 'missing'
+            return {'pending_event_exists': pending_approval and not finalized, 'lifecycle_status': status}
+
     @property
     def events(self):
         with self._lock:

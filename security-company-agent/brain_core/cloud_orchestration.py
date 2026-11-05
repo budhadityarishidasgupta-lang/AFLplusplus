@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import hmac
 import json
 import threading
+import uuid
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -46,13 +47,25 @@ class CloudOrchestrationError(RuntimeError):
         'provider_construction', 'authorization_setup', 'adapter_inference',
         'result_accounting', 'unknown'
     })
+    ACCOUNTING_ERROR_CLASSES = frozenset({
+        'CloudApprovalRequired', 'TypeError', 'ValueError', 'AttributeError', 'KeyError',
+        'RuntimeError', 'OSError', 'OtherError'
+    })
 
-    def __init__(self, message: str, *, diagnostic: str = 'unknown', substage: str = 'unknown'):
+    def __init__(self, message: str, *, diagnostic: str = 'unknown', substage: str = 'unknown',
+                 accounting_operation_id: str | None = None, accounting_error_class: str | None = None,
+                 pending_event_exists: bool | None = None, lifecycle_status: str | None = None,
+                 accounting_callback_invoked: bool | None = None):
         super().__init__(message)
         self.diagnostic = (diagnostic if isinstance(diagnostic, str) and diagnostic in self.DIAGNOSTICS
                            else 'unknown')
         self.substage = (substage if isinstance(substage, str) and substage in self.SUBSTAGES
                          else 'unknown')
+        self.accounting_operation_id = accounting_operation_id
+        self.accounting_error_class = accounting_error_class
+        self.pending_event_exists = pending_event_exists
+        self.lifecycle_status = lifecycle_status
+        self.accounting_callback_invoked = accounting_callback_invoked
 
 
 class CloudOrchestrator:
@@ -457,10 +470,13 @@ class CloudOrchestrator:
                 raise CloudOrchestrationError(
                     'Cloud adapter inference failed; authorization remains consumed.',
                     diagnostic='request_execution', substage='adapter_inference') from error
+            accounting_operation_id = uuid.uuid4().hex
+            accounting_callback_invoked = self._result_accountant is not None
             try:
                 if self._result_accountant is not None:
                     self._result_accountant(
-                        request=request, result=result, conversation_id=conversation_id)
+                        request=request, result=result, conversation_id=conversation_id,
+                        accounting_operation_id=accounting_operation_id)
                 else:
                     self._consent.record_result(
                         request.approval_id, success=result.status == 'success',
@@ -469,9 +485,21 @@ class CloudOrchestrator:
                         reported_cost_usd=getattr(result, 'reported_cost_usd', None),
                         error_category=getattr(result, 'error_category', None))
             except Exception as error:
+                try:
+                    accounting_state = self._consent.accounting_state(request.approval_id)
+                except Exception:
+                    accounting_state = {'pending_event_exists': None, 'lifecycle_status': 'unknown'}
+                safe_error_class = type(error).__name__
+                if safe_error_class not in CloudOrchestrationError.ACCOUNTING_ERROR_CLASSES:
+                    safe_error_class = 'OtherError'
                 raise CloudOrchestrationError(
                     'Cloud result accounting failed; authorization remains consumed.',
-                    diagnostic='request_execution', substage='result_accounting') from error
+                    diagnostic='request_execution', substage='result_accounting',
+                    accounting_operation_id=accounting_operation_id,
+                    accounting_error_class=safe_error_class,
+                    pending_event_exists=accounting_state['pending_event_exists'],
+                    lifecycle_status=accounting_state['lifecycle_status'],
+                    accounting_callback_invoked=accounting_callback_invoked) from error
             if self._result_writer is not None and result.status == 'success':
                 try:
                     self._result_writer(conversation_id, result, lessons_snapshot)
