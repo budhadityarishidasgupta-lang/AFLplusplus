@@ -1484,6 +1484,41 @@ def _unused_render_admin_duplicate(profile, mode, remote_authorized, model, read
                     st.warning('This result has no saved training turn to rate.')
 
 
+def _observe_capability_update_for_chat():
+    """Observe a validated capability report once per accepted chat turn, without inference."""
+    from brain_core import agent_awareness, capability_communication
+
+    try:
+        capability_communication.observe_capability_update(
+            _capability_report_path(), data_dir=studio.DATA)
+    except (agent_awareness.CapabilityReportError, capability_communication.CapabilityEvidenceError,
+            OSError, ValueError, TypeError):
+        # Invalid or unavailable evidence must never create a notice or interrupt chat.
+        return
+
+
+def _render_pending_capability_notice():
+    """Present durable notices at most once per rerun; leave acknowledgement explicit."""
+    from brain_core.capability_communication import CapabilityUpdateStore, store_path
+
+    store = CapabilityUpdateStore(store_path(studio.DATA))
+    pending = store.pending_all()
+    rendered = st.session_state.setdefault('_capability_notices_rendered', set())
+    if not pending:
+        return
+    notice = pending[0]
+    if notice['change_key'] in rendered:
+        return
+    with st.chat_message('assistant'):
+        st.markdown(notice['message'])
+    if store.communicated(notice['change_key']):
+        rendered.add(notice['change_key'])
+        conversation.save_message(
+            st.session_state.get('conversation_id'), 'assistant', notice['message'],
+            message_type='capability_update_notice', related_lesson_id=notice['change_key'],
+            data_dir=studio.DATA, db_path=studio.DB)
+
+
 def _capability_report_path():
     configured = os.environ.get('SOVEREIGN_BRAIN_CAPABILITY_REPORT')
     if configured:
@@ -1553,6 +1588,8 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
                                    'Explicit training continuation for the active conversation draft.')
     conversation.save_message(session_id, 'user', user_text, message_type=route.intent,
                               data_dir=studio.DATA, db_path=studio.DB)
+    _observe_capability_update_for_chat()
+    _render_pending_capability_notice()
     if route.intent == 'training_cancel':
         if persisted_pending and persisted_pending.get('status') == 'incomplete':
             _save_response(session_id, 'Understood. The incomplete training draft is canceled.', 'training_canceled')
@@ -1715,34 +1752,98 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
         st.info(summary)
         _save_response(session_id, summary, 'mission')
         return
+    if route.intent == 'capability_acknowledgement':
+        from brain_core.capability_communication import CapabilityUpdateStore, store_path
+        store = CapabilityUpdateStore(store_path(studio.DATA))
+        update = store.pending()
+        if update is None:
+            latest = store.latest()
+            if latest and latest['status'] == 'communicated':
+                update = latest
+        if update and store.acknowledge(update['change_key']):
+            _save_response(session_id, 'Acknowledged. I will keep the update available as operational information, separate from personality and approved lessons.', 'capability_update_acknowledged')
+        else:
+            _save_response(session_id, 'There is no new capability update awaiting acknowledgement.', 'capability_update_acknowledged')
+        return
+    if route.intent == 'capability_update':
+        from brain_core.capability_communication import CapabilityUpdateStore, store_path
+        store = CapabilityUpdateStore(store_path(studio.DATA))
+        update = store.pending() or store.latest()
+        if update:
+            import json
+            update_evidence = json.loads(update['evidence_json'])
+            changes = (update_evidence.get('change') or {}).get('changes', [])
+            categories = {item.get('category') for item in changes}
+            if 'manifest_removed' in categories:
+                noun = 'agent'
+            elif categories & {'capability_added', 'capability_removed'}:
+                noun = 'capability'
+            elif categories:
+                noun = 'agent capability information'
+            else:
+                noun = 'reported capability state'
+            answer = f"The latest update concerns {noun}: {update['message']}"
+            runtime = update_evidence.get('runtime')
+            if runtime:
+                from brain_core.capability_communication import validate_runtime_evidence
+                runtime = validate_runtime_evidence(runtime)
+                unavailable = sorted({item['agent_id'].replace('-', ' ').replace('.', ' ')
+                                      for item in runtime['assessments']
+                                      if item['state'] != 'VERIFIED_AVAILABLE'})
+                answer += (' Current local runtime evidence reports these capabilities unavailable for verified command: '
+                           + ', '.join(unavailable) + '. This is not an execution permission.'
+                           if unavailable else
+                           ' Current local checks verify runtime availability but do not grant execution permission.')
+            _save_response(session_id, answer, 'capability_update')
+            store.communicated(update['change_key'])
+        else:
+            try:
+                from brain_core import agent_awareness
+                report = agent_awareness.read_capability_report(_capability_report_path())
+                answer = agent_awareness.answer_agent_question('What have you learned about your agents?', report)
+            except (agent_awareness.CapabilityReportError, OSError, ValueError):
+                answer = 'I have not recorded a new verified capability update, and no valid capability report is available.'
+            _save_response(session_id, answer, 'capability_update')
+        return
     if route.intent == 'agent_awareness':
         from brain_core import agent_awareness
         try:
             report_path = _capability_report_path()
             report = agent_awareness.read_capability_report(report_path)
             answer = conversation.respond_agent_awareness(user_text, report)
+            if any(term in user_text.casefold() for term in ('unavailable', 'not available', 'cannot command')):
+                from brain_core.capability_communication import CapabilityUpdateStore, store_path, validate_runtime_evidence
+                capability_store = CapabilityUpdateStore(store_path(studio.DATA))
+                runtime_snapshot = None
+                latest_update = capability_store.latest()
+                if latest_update:
+                    with capability_store._connection() as connection:
+                        row = connection.execute('SELECT evidence_json FROM capability_updates WHERE change_key=?',
+                                                 (latest_update['change_key'],)).fetchone()
+                    if row:
+                        import json
+                        runtime_snapshot = json.loads(row[0]).get('runtime')
+                if runtime_snapshot:
+                    runtime = validate_runtime_evidence(runtime_snapshot)
+                    unavailable = sorted({item['agent_id'].replace('-', ' ').replace('.', ' ')
+                                          for item in runtime['assessments']
+                                          if item['state'] != 'VERIFIED_AVAILABLE'})
+                    answer = ('These agents remain unavailable for verified runtime command: ' + ', '.join(unavailable) +
+                              '. Published or installed metadata alone is not execution readiness.'
+                              if unavailable else 'Local runtime checks currently verify the listed capabilities as available; this does not grant permission to execute them.')
+                else:
+                    unavailable = [agent['identity'].replace('-', ' ').replace('.', ' ')
+                                   for agent in report['agents'] if not agent['ready']]
+                    answer = ('These agents remain unavailable for command: ' + ', '.join(unavailable) +
+                              '. Their declared capabilities are informational; no runtime availability report is recorded.'
+                              if unavailable else 'The report shows no unavailable agents, but that alone does not authorize execution.')
+            if 'which agents or capabilities are missing' in user_text.casefold() or 'what agents or capabilities are missing' in user_text.casefold():
+                answer = agent_awareness.answer_agent_question(user_text, report)
         except (agent_awareness.CapabilityReportError, OSError, ValueError):
             answer = 'I cannot safely answer about agent capabilities because no valid capability report is available.'
         _save_response(session_id, answer, 'agent_awareness')
         return
     if route.intent == 'general':
-        from brain_core import agent_awareness
-        if st.session_state.get('studio_inference') != 'Offline demonstration':
-            try:
-                report_path = _capability_report_path()
-                report = agent_awareness.read_capability_report(report_path)
-                announcement_key = '_agent_awareness_announcement_fingerprint'
-                fingerprint = agent_awareness.report_fingerprint(report)
-                previous = st.session_state.get(announcement_key)
-                if previous != fingerprint:
-                    previous_report = st.session_state.get('_agent_awareness_report')
-                    announcement = agent_awareness.capability_change(previous_report, report)
-                    st.session_state[announcement_key] = fingerprint
-                    st.session_state['_agent_awareness_report'] = report
-                    if announcement:
-                        _save_response(session_id, announcement, 'agent_awareness_update')
-            except (agent_awareness.CapabilityReportError, OSError, ValueError):
-                pass
         _run_general_answer(user_text, session_id, profile, model_config)
         _render_cloud_approval(session_id)
         return
@@ -1937,15 +2038,36 @@ def render_conversation(profile, ready, model_config, configuration_error):
         st.info('Automatic journey pending approval: review the exact OpenAI payload below. It will not be sent until you approve.')
     st.caption('Model: ' + ('available' if ready else 'not available; lessons and recall remain available'))
     history = conversation.load_messages(session_id, data_dir=studio.DATA, db_path=studio.DB)
+    _rendered_notices = st.session_state.setdefault('_capability_notices_rendered', set())
     for item in history:
+        notice_key = item.get('related_lesson_id') if item.get('message_type') == 'capability_update_notice' else None
+        if notice_key:
+            _rendered_notices.add(notice_key)
         with st.chat_message(item['role']):
             st.markdown(item['content'])
             pending = st.session_state.get('pending_lesson')
             if item['message_type'] == 'lesson_proposal' and pending and pending.get('message_id') == item['message_id'] and pending.get('conversation_id') == session_id:
                 _lesson_editor(item, pending)
+    _observe_capability_update_for_chat()
+    _render_pending_capability_notice()
     _show_research_citations(session_id)
     _render_candidate_learning_review(session_id)
     _render_conversation_research_approval(session_id)
+    from brain_core.capability_communication import CapabilityUpdateStore, store_path
+    capability_store = CapabilityUpdateStore(store_path(studio.DATA))
+    latest_update = capability_store.latest()
+    if latest_update:
+        with st.container(border=True):
+            st.caption('Latest capability update')
+            st.write(latest_update['message'])
+            pending_updates = capability_store.pending_all()
+            if pending_updates and st.button('Acknowledge update', key='ack_capability_update'):
+                if capability_store.acknowledge(pending_updates[0]['change_key']):
+                    conversation.save_message(
+                        session_id, 'assistant',
+                        'Acknowledged. I will keep the update available as operational information, separate from personality and approved lessons.',
+                        message_type='capability_update_acknowledged', data_dir=studio.DATA, db_path=studio.DB)
+                st.rerun()
     general_store = st.session_state.get('_general_journey_store', {})
     general_turn = general_store.get(session_id)
     if general_turn is not None and general_turn.research_item is not None:

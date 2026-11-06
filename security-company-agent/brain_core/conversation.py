@@ -52,13 +52,22 @@ def classify_intent(text: str) -> Route:
     # The teaching lead-in only applies to the message that starts the workflow;
     # later labeled submissions remain training even if lesson content contains
     # a question-like phrase.
+    if re.search(r'\b(?:acknowledge|understood|got it)\b.*\b(?:capability|agent)\b|\b(?:acknowledge|confirm) (?:the )?(?:latest )?(?:capability )?update\b', folded):
+        return Route('capability_acknowledgement', 'explicit', 'Explicit acknowledgement of a capability update.')
+    if re.search(
+            r'\b(?:what changed|latest capability update|latest agent update|capability update|'
+            r'what changed in your capabilities|what capabilities changed)\b', folded):
+        return Route('capability_update', 'explicit', 'Read-only query about a detected capability update.')
+    if re.search(r'\b(?:which agents remain unavailable|which agents are unavailable|what agents are unavailable|unavailable agents)\b', folded):
+        return Route('agent_awareness', 'explicit', 'Read-only question about unavailable agents.')
     awareness = bool(re.search(
         r'\b(which agents do you know|what agents do you know|what agents are there|list (?:the )?agents|'
         r'what agents have you identified|what have you learned about (?:your|my|the) agent(?:s)?\b|'
         r'what do you understand about (?:your|my) agents|'
         r'tell me what agents you know|'
         r'what (?:can|capabilities can) (?:my )?agents do|what are (?:my )?agents capable of|'
-        r'what can my agents do|can you command|'
+        r'what can my agents do|can you command|which agents remain unavailable|which agents are unavailable|'
+        r'what agents are unavailable|unavailable agents|which capabilities remain unavailable|what capabilities remain unavailable|'
         r'command (?:the )?.*agents|run (?:the )?.*agents|execute (?:the )?.*agents|'
         r'which capabilities are missing|what capabilities are missing|what capabilities are still missing|'
         r'which agents or capabilities are missing|what agents or capabilities are missing|'
