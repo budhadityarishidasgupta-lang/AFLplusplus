@@ -269,7 +269,11 @@ class DelegationAuthorizer:
             raise AuthorizationError("delegation context contains invalid or unsafe fields")
         if proposal.parent_mission_ref != context.mission_ref or proposal.parent_task_ref != context.task_ref:
             return self._decision(DelegationDecisionState.BLOCKED, context, proposal, None, ("proposal parent references do not match the authorized mission/task",), (), False)
-        if context.parent_task_ref and proposal.parent_task_ref in context.ancestor_task_refs:
+        if (context.task_ref in context.ancestor_task_refs
+                or len(set(context.ancestor_task_refs)) != len(context.ancestor_task_refs)
+                or context.parent_task_ref is not None
+                and context.parent_task_ref in context.ancestor_task_refs
+                and context.parent_task_ref != context.ancestor_task_refs[-1]):
             return self._decision(DelegationDecisionState.BLOCKED, context, proposal, None, ("delegation cycle detected in parent ancestry",), (), False)
         if not isinstance(requested_task_type, str) or not self._stable_task(requested_task_type):
             return self._decision(DelegationDecisionState.UNKNOWN, context, proposal, None, ("requested task type is not a stable identifier",), ("valid task type",), False)
