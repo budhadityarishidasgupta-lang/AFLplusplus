@@ -406,6 +406,7 @@ class ExecutionEngine:
         authorization_issuer: ExecutionAuthorizationIssuer,
         *,
         limits: ExecutionLimits | None = None,
+        tool_gateway: Any | None = None,
     ) -> None:
         if (
             not isinstance(registry, CapabilityRegistry)
@@ -414,7 +415,10 @@ class ExecutionEngine:
             raise ExecutionError("registry and authorization issuer are required")
         if limits is not None and not isinstance(limits, ExecutionLimits):
             raise ExecutionError("limits must be an ExecutionLimits instance")
+        if tool_gateway is not None and not callable(getattr(tool_gateway, "begin_task", None)):
+            raise ExecutionError("tool_gateway must implement the bounded gateway contract")
         self.registry = registry
+        self.tool_gateway = tool_gateway
         self.authorization_issuer = authorization_issuer
         self.limits = limits or ExecutionLimits()
         self._adapters: dict[str, ExecutionAdapter] = {}
@@ -550,6 +554,14 @@ class ExecutionEngine:
                 request, ExecutionState.RUNNING, None,
                 "synthetic adapter invoked",
             )
+            if self.tool_gateway is not None:
+                try:
+                    self.tool_gateway.begin_task(request, authorization, task_lock)
+                except Exception:
+                    state = ExecutionState.FAILED
+                    category = ErrorCategory.AUTHORIZATION
+                    error_message = "tool gateway authorization was rejected"
+                    return self._finish(request, state, started, monotonic_start, category, error_message)
             deadline = min(
                 request.timeout_seconds or self.limits.max_duration_seconds,
                 self.limits.max_duration_seconds,
@@ -559,12 +571,20 @@ class ExecutionEngine:
 
             def invoke() -> None:
                 try:
+                    bind = getattr(adapter, "bind_tool_gateway", None)
+                    if self.tool_gateway is not None and callable(bind):
+                        bind(self.tool_gateway, request, authorization)
                     holder["output"] = adapter.invoke(
                         request.capability, request.input_data, task_lock
                     )
                 except Exception as error:  # sanitize adapter exceptions
                     holder["error_type"] = type(error).__name__
                 finally:
+                    if self.tool_gateway is not None:
+                        try:
+                            self.tool_gateway.end_task(request.task_id)
+                        except Exception:
+                            pass
                     done.set()
 
             def release_worker_slot() -> None:
