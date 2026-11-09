@@ -44,6 +44,7 @@ class ExecutionState(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     TIMED_OUT = "timed_out"
+    RECONCILIATION_REQUIRED = "reconciliation_required"
 
 
 class ErrorCategory(str, Enum):
@@ -282,6 +283,7 @@ class ExecutionAuthorizationIssuer:
         self._revoked: set[str] = set()
         self._generation = 0
         self._lock = threading.Lock()
+        self._durable_store: Any | None = None
 
     def authorize(
         self,
@@ -353,7 +355,24 @@ class ExecutionAuthorizationIssuer:
             if auth_id in self._issued:
                 raise ExecutionDenied("authorization identifier replay rejected")
             self._issued[auth_id] = authorization
+        if self._durable_store is not None:
+            try:
+                self._durable_store.record_authorization(authorization)
+            except Exception:
+                with self._lock:
+                    self._issued.pop(auth_id, None)
+                raise ExecutionDenied("authorization could not be durably recorded") from None
         return authorization
+
+    def bind_durable_store(self, store: Any) -> None:
+        """Persist issuer records into the same durable ledger before execution admission."""
+        if not callable(getattr(store, "record_authorization", None)):
+            raise ExecutionDenied("durable authorization store is invalid")
+        self._durable_store = store
+        with self._lock:
+            issued = tuple(self._issued.values())
+        for authorization in issued:
+            store.record_authorization(authorization)
 
     def revoke(self, authorization: ExecutionAuthorization) -> bool:
         if not isinstance(authorization, ExecutionAuthorization):
@@ -394,6 +413,11 @@ class ExecutionAuthorizationIssuer:
                 or set(request.permissions) != set(authorization.permissions)
             ):
                 raise ExecutionDenied("authorization does not match task, scope, adapter, or input")
+            if self._durable_store is not None:
+                try:
+                    self._durable_store.consume_authorization(authorization, request, now)
+                except Exception:
+                    raise ExecutionDenied("execution authorization could not be durably consumed") from None
             self._used.add(authorization.authorization_id)
 
 
@@ -407,6 +431,7 @@ class ExecutionEngine:
         *,
         limits: ExecutionLimits | None = None,
         tool_gateway: Any | None = None,
+        durable_store: Any | None = None,
     ) -> None:
         if (
             not isinstance(registry, CapabilityRegistry)
@@ -421,6 +446,14 @@ class ExecutionEngine:
         self.tool_gateway = tool_gateway
         self.authorization_issuer = authorization_issuer
         self.limits = limits or ExecutionLimits()
+        self.durable_store = durable_store
+        if durable_store is not None:
+            if not all(callable(getattr(durable_store, name, None)) for name in (
+                "record_authorization", "claim", "transition", "get_claim", "recover_inflight", "reconcile"
+            )):
+                raise ExecutionError("durable_store does not implement the durable claim contract")
+            authorization_issuer.bind_durable_store(durable_store)
+            durable_store.recover_inflight(current_owner=True)
         self._adapters: dict[str, ExecutionAdapter] = {}
         self._lock = threading.RLock()
         self._active: tuple[ExecutionRequest, threading.Event] | None = None
@@ -524,6 +557,13 @@ class ExecutionEngine:
                     "single execution slot occupied",
                 )
                 raise ExecutionBusy("single execution slot is occupied")
+            if self.durable_store is not None:
+                try:
+                    if self.durable_store.get_claim(request.task_id) is not None:
+                        raise ExecutionDenied("task_id already has a durable claim")
+                    self.durable_store.claim(request, authorization)
+                except Exception:
+                    raise ExecutionDenied("durable execution claim was rejected") from None
             self._active = (request, task_lock)
             self._audit(
                 request, ExecutionState.PENDING, None, "task accepted"
@@ -535,12 +575,16 @@ class ExecutionEngine:
         try:
             adapter = self._validate_invocation(request)
             self.authorization_issuer._consume(authorization, request, started)
+            if self.durable_store is not None:
+                self.durable_store.transition(request.task_id, "AUTHORIZED")
             self._audit(
                 request, ExecutionState.AUTHORIZED, None,
                 "execution authorization accepted",
             )
             state = ExecutionState.AUTHORIZED
             if self._cancelled_task(request.task_id):
+                if self.durable_store is not None:
+                    self.durable_store.transition(request.task_id, "CANCELLED")
                 with self._lock:
                     self._cancelled.discard(request.task_id)
                 state = ExecutionState.CANCELLED
@@ -550,10 +594,8 @@ class ExecutionEngine:
                     request, state, started, monotonic_start,
                     category, error_message,
                 )
-            self._audit(
-                request, ExecutionState.RUNNING, None,
-                "synthetic adapter invoked",
-            )
+            if self.durable_store is not None:
+                self.durable_store.transition(request.task_id, "INVOKING")
             if self.tool_gateway is not None:
                 try:
                     self.tool_gateway.begin_task(request, authorization, task_lock)
@@ -595,6 +637,10 @@ class ExecutionEngine:
                     if self._active and self._active[0].task_id == request.task_id:
                         self._active = None
 
+            self._audit(
+                request, ExecutionState.RUNNING, None,
+                "synthetic adapter invocation admitted",
+            )
             worker = threading.Thread(
                 target=invoke,
                 name=f"synthetic-task-{request.task_id}",
@@ -742,6 +788,37 @@ class ExecutionEngine:
         output: Any = None,
         release_slot: bool = True,
     ) -> ExecutionResult:
+        if self.durable_store is not None:
+            try:
+                durable_state = (
+                    "COMPLETED" if state is ExecutionState.COMPLETED
+                    else "RECONCILIATION_REQUIRED"
+                    if state is ExecutionState.RECONCILIATION_REQUIRED
+                    else state.value.upper()
+                )
+                self.durable_store.transition(
+                    request.task_id,
+                    durable_state,
+                    result={"output": output} if state is ExecutionState.COMPLETED else None,
+                    error_category=category.value if category else None,
+                    error_message=error_message,
+                )
+            except Exception:
+                try:
+                    claim = self.durable_store.get_claim(request.task_id)
+                    if claim is not None and claim["state"] in {"CLAIMED", "AUTHORIZED", "INVOKING"}:
+                        self.durable_store.transition(
+                            request.task_id,
+                            "RECONCILIATION_REQUIRED",
+                            error_category=ErrorCategory.INTERNAL.value,
+                            error_message="execution outcome could not be durably recorded",
+                        )
+                except Exception:
+                    pass
+                state = ExecutionState.RECONCILIATION_REQUIRED
+                output = None
+                category = ErrorCategory.INTERNAL
+                error_message = "execution outcome could not be durably recorded; reconciliation required"
         result = ExecutionResult(
             task_id=request.task_id,
             mission_id=request.mission_id,
