@@ -52,6 +52,134 @@ def _boolean(value: Any, label: str) -> bool:
     return value
 
 
+def adapt_verification_report(raw: Any) -> dict[str, Any]:
+    """Adapt the orchestration verification envelope to strict SB-34 schema v1.
+
+    This is a shape conversion only: static status and evidence are preserved,
+    while execution readiness and permissions remain explicitly ungranted.
+    """
+    if not isinstance(raw, Mapping):
+        raise CapabilityReportError("Unsupported capability report.")
+    required = {"agents", "execution_verified", "permissions_granted", "capability_states"}
+    allowed = required | {"execution_note"}
+    if not required.issubset(raw) or set(raw) - allowed:
+        raise CapabilityReportError("Malformed orchestration capability report.")
+    if type(raw["execution_verified"]) is not bool or raw["execution_verified"]:
+        raise CapabilityReportError("Execution claims are not accepted from static reports.")
+    if type(raw["permissions_granted"]) is not bool or raw["permissions_granted"]:
+        raise CapabilityReportError("Permission grants are not accepted from capability reports.")
+    if (not isinstance(raw["agents"], list) or not isinstance(raw["capability_states"], list)
+            or len(raw["agents"]) > 128 or len(raw["capability_states"]) > 4096):
+        raise CapabilityReportError("Malformed orchestration capability report.")
+
+    states = {}
+    for state in raw["capability_states"]:
+        if not isinstance(state, Mapping) or not {"agent", "capability", "state", "description", "readiness", "reason"}.issubset(state):
+            raise CapabilityReportError("Malformed orchestration capability state.")
+        agent = _string(state["agent"], "capability state agent")
+        capability = _string(state["capability"], "capability state name")
+        status = _string(state["state"], "capability state")
+        if status not in _STATUSES or type(state["readiness"]) is not bool or state["readiness"]:
+            raise CapabilityReportError("Invalid orchestration capability state.")
+        key = (agent, capability)
+        if key in states:
+            raise CapabilityReportError("Duplicate orchestration capability state.")
+        reason = state["reason"]
+        if reason is not None and not isinstance(reason, str):
+            raise CapabilityReportError("Invalid orchestration capability state reason.")
+        if status == "verified" and not (reason or "").strip():
+            reason = "Static metadata verified; runtime execution remains unavailable."
+        states[key] = {"agent": agent, "capability": capability, "state": status,
+                       "description": _string(state["description"], "capability description"),
+                       "readiness": False, "reason": reason}
+
+    converted_agents = []
+    declared = set()
+    for source in raw["agents"]:
+        fields = {"identity", "version", "verification_status", "evidence", "missing_requirements",
+                  "execution_readiness", "last_verified_at", "uncertainty_reason", "capabilities"}
+        if (not isinstance(source, Mapping) or not fields.issubset(source)
+                or set(source) - fields - {"purpose"}):
+            raise CapabilityReportError("Malformed orchestration agent record.")
+        identity = _string(source["identity"], "agent identity")
+        if not _IDENTIFIER.fullmatch(identity) or identity in declared:
+            raise CapabilityReportError("Duplicate or invalid orchestration agent identity.")
+        declared.add(identity)
+        verification_status = _string(source["verification_status"], "verification status")
+        if verification_status not in _STATUSES:
+            raise CapabilityReportError("Unknown orchestration verification status.")
+        readiness = source["execution_readiness"]
+        if not isinstance(readiness, Mapping) or set(readiness) != {"ready", "reason"}:
+            raise CapabilityReportError("Malformed orchestration execution readiness.")
+        if type(readiness["ready"]) is not bool or readiness["ready"]:
+            raise CapabilityReportError("Static report cannot assert command readiness.")
+        capabilities = source["capabilities"]
+        if not isinstance(capabilities, list):
+            raise CapabilityReportError("Malformed orchestration capability list.")
+        converted_capabilities = []
+        seen_capabilities = set()
+        for source_capability in capabilities:
+            cap_fields = {"capability", "status", "evidence", "missing_requirements",
+                          "execution_readiness", "required_permissions", "last_verified_at",
+                          "uncertainty_reason", "description"}
+            if (not isinstance(source_capability, Mapping) or not cap_fields.issubset(source_capability)
+                    or set(source_capability) != cap_fields):
+                raise CapabilityReportError("Malformed orchestration capability record.")
+            name = _string(source_capability["capability"], "capability name")
+            if not _IDENTIFIER.fullmatch(name) or name in seen_capabilities:
+                raise CapabilityReportError("Invalid or duplicate orchestration capability name.")
+            seen_capabilities.add(name)
+            if _string(source_capability["status"], "capability status") not in _STATUSES:
+                raise CapabilityReportError("Unknown orchestration capability status.")
+            key = (identity, name)
+            state = states.get(key)
+            if state is None:
+                raise CapabilityReportError("Orchestration capability state is missing.")
+            cap_readiness = source_capability["execution_readiness"]
+            if (not isinstance(cap_readiness, Mapping) or set(cap_readiness) != {"ready", "reason"}
+                    or type(cap_readiness["ready"]) is not bool or cap_readiness["ready"]):
+                raise CapabilityReportError("Static report cannot assert capability readiness.")
+            for list_field in ("evidence", "missing_requirements", "required_permissions"):
+                _string_list(source_capability[list_field], list_field.replace("_", " "))
+            converted_capabilities.append({
+                "capability": name, "status": state["state"],
+                "evidence": list(source_capability["evidence"]),
+                "missing_requirements": list(source_capability["missing_requirements"]),
+                "execution_readiness": {"ready": False, "reason": _string(
+                    cap_readiness["reason"], "capability readiness reason")},
+                "required_permissions": list(source_capability["required_permissions"]),
+                "last_verified_at": (None if source_capability["last_verified_at"] is None else
+                                     _string(source_capability["last_verified_at"], "verification timestamp")),
+                "uncertainty_reason": (None if source_capability["uncertainty_reason"] is None else
+                                       _string(source_capability["uncertainty_reason"], "uncertainty reason")),
+                "description": state["description"],
+            })
+        converted_agents.append({
+            "identity": identity, "version": _string(source["version"], "agent version"),
+            "verification_status": _string(source["verification_status"], "verification status"),
+            "evidence": list(_string_list(source["evidence"], "agent evidence")),
+            "missing_requirements": list(_string_list(source["missing_requirements"], "missing requirement")),
+            "execution_readiness": {"ready": False, "reason": _string(
+                readiness["reason"], "execution readiness reason")},
+            "last_verified_at": (None if source["last_verified_at"] is None else
+                                 _string(source["last_verified_at"], "verification timestamp")),
+            "uncertainty_reason": (None if source["uncertainty_reason"] is None else
+                                   _string(source["uncertainty_reason"], "uncertainty reason")),
+            "capabilities": converted_capabilities,
+        })
+    if set(states) != {(agent["identity"], cap["capability"])
+                       for agent in converted_agents for cap in agent["capabilities"]}:
+        raise CapabilityReportError("Orchestration capability states do not match declarations.")
+    result = {"schema_version": _REPORT_VERSION, "agents": converted_agents,
+              "unsupported_capabilities": [], "execution_verified": False,
+              "permissions_granted": False,
+              "capability_states": list(states.values())}
+    if "execution_note" in raw:
+        result["execution_note"] = _string(raw["execution_note"], "execution note")
+    validate_capability_report(result)
+    return result
+
+
 def validate_capability_report(raw: Any) -> dict[str, Any]:
     """Return a normalized report, rejecting malformed and unsafe input."""
     if not isinstance(raw, Mapping):

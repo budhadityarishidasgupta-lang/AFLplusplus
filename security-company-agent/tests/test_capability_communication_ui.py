@@ -19,7 +19,7 @@ if str(REPO) not in sys.path:
 
 from brain_core import capability_communication as communication
 from brain_core import conversation
-from test_agent_awareness import valid_report
+from capability_report_fixtures import valid_report
 
 
 def report_file(tmp_path: Path, *, changed: bool = False, invalid: bool = False) -> Path:

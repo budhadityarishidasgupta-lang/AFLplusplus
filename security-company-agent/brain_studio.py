@@ -14,6 +14,7 @@ from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv(filename='.env', usecwd=True) or Path(__file__).resolve().with_name('.env'), override=False)
 
 from brain_core import conversation, lessons, personality, service, studio, trainer
+from brain_core import agent_awareness as _agent_awareness
 from brain_core import cloud_orchestration
 from brain_core.appraisal import NEUTRAL
 from brain_core.model_api import (ModelConfig, ModelError, ModelOutputError, local_inventory,
@@ -1519,6 +1520,24 @@ def _render_pending_capability_notice():
             data_dir=studio.DATA, db_path=studio.DB)
 
 
+def _build_capability_report_offline():
+    """Create a static-only report from declared orchestration contracts."""
+    from control_plane.agent_discovery import AgentDiscovery
+    from control_plane.capability_verification import verification_report
+    orchestration = Path(__file__).resolve().parents[3] / 'agent-orchestration'
+    report = verification_report(AgentDiscovery(), workspace=orchestration)
+    adapted = agent_awareness.adapt_verification_report(report)
+    purposes = {
+        'multi-agent.local-recon': 'Inspect local Python source and create a fuzzing plan.',
+        'multi-agent.evolutionary-exploit-dev': 'Generate and mutate payloads in a local simulated workflow.',
+        'enterprise-range.system-architect': 'Coordinate bounded campaign state and approval gates.',
+    }
+    for agent in adapted['agents']:
+        if agent['identity'] in purposes:
+            agent['purpose'] = purposes[agent['identity']]
+    return agent_awareness.read_capability_report(adapted)
+
+
 def _capability_report_path():
     configured = os.environ.get('SOVEREIGN_BRAIN_CAPABILITY_REPORT')
     if configured:
@@ -1570,13 +1589,6 @@ def _lesson_editor(message, pending):
 
 def _handle_message(user_text, session_id, history_messages, profile, model_config, configuration_error):
     route = conversation.classify_intent(user_text)
-    if (route.intent == 'mission' and route.confidence == 'explicit'
-            and _research_relevant(user_text)
-            and not re.search(
-                r"\b(please|i need|i want|help me|my goal|my objective|research|investigate|compare|evaluate|recommend|find|identify|look up|plan|design|organize|prepare|build|create|develop|implement|migrate|upgrade|set up|configure|diagnose|troubleshoot|audit|assess)\b",
-                user_text, re.I)):
-        route = conversation.Route('emotional_reasoning', 'default',
-                                   'Terse research context remains in the existing conversation flow.')
     persisted_pending = conversation.load_lesson_state(session_id, data_dir=studio.DATA, db_path=studio.DB)
     # Never let an incomplete draft capture a separate request. Only an explicit
     # training signal (or a labeled field update) continues the workflow.
@@ -1713,16 +1725,10 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
             if st.session_state.get('pending_lesson', {}).get('conversation_id') == session_id:
                 st.session_state.pending_lesson = None
         return
-    if route.intent == 'mission' and route.confidence == 'explicit' and not (
-            _research_relevant(user_text)
-            and re.search(r"\b(i feel|i am worried|i'm worried|my friend|my colleague|conversation)\b", user_text, re.I)):
+    if route.intent == 'mission' and route.confidence == 'explicit':
         prior_user_mission = any(
             message.get('role') == 'user' and message.get('content') == user_text
             and message.get('message_type') == 'mission' for message in history_messages)
-        if _research_relevant(user_text) and not re.search(
-                r"\b(please|i need|i want|help me|my goal|my objective|research|investigate|compare|evaluate|recommend|find|identify|look up|plan|design|organize|prepare|build|create|develop|implement|migrate|upgrade|set up|configure|diagnose|troubleshoot|audit|assess)\b",
-                user_text, re.I):
-            prior_user_mission = False
         prior_assistant_mission = any(
             message.get('role') == 'assistant' and message.get('message_type') == 'mission'
             and any(previous.get('role') == 'user' and previous.get('content') == user_text
@@ -1733,24 +1739,102 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
         if st.session_state.get('studio_inference') == 'Offline demonstration':
             _save_response(session_id, 'Mission planning is unavailable in Offline demonstration mode. No mission was interpreted, and nothing was sent or executed.', 'mission_unavailable')
             return
-        from brain_core import agent_awareness, mission_intelligence
+        from brain_core import agent_awareness, mission_controller, mission_conversation
+        import sys
+        sys.modules[__name__].agent_awareness = agent_awareness
+        sys.modules[__name__].mission_controller = mission_controller
+        sys.modules[__name__].mission_conversation = mission_conversation
+
+        def capability_provider():
+            try:
+                report = agent_awareness.read_capability_report(_capability_report_path())
+            except (agent_awareness.CapabilityReportError, OSError, ValueError, TypeError):
+                report = _build_capability_report_offline()
+            return report, agent_awareness.report_fingerprint(report)
+
+        controller = mission_controller.MissionController(
+            builder=mission_conversation.build_mission,
+            repository=mission_controller.ConversationMissionRepository(conversation),
+            capability_provider=capability_provider)
         try:
-            capability_report = agent_awareness.read_capability_report(_capability_report_path())
-        except (agent_awareness.CapabilityReportError, OSError, ValueError):
-            capability_report = None
-        mission = mission_intelligence.define_mission(user_text, capability_report=capability_report)
-        if mission is None:
+            result = controller.handle(mission_controller.MissionRequest(
+                user_text, session_id, route.intent, route.confidence,
+                st.session_state.get('studio_inference')))
+        except (agent_awareness.CapabilityReportError, mission_conversation.MissionConversationError,
+                OSError, ValueError, TypeError):
+            result = mission_controller.MissionControllerResult(False, reason='unavailable')
+        if result.reason == 'unavailable_offline':
+            _save_response(session_id, 'Mission planning is unavailable in Offline demonstration mode. No mission was interpreted, and nothing was sent or executed.', 'mission_unavailable')
+            return
+        if result.reason == 'conversation_already_bound':
+            _save_response(session_id, 'This conversation already has a mission bound to it. Start a new conversation to plan a different mission.', 'mission_status')
+            return
+        state = result.state
+        if state is not None:
+            st.session_state.setdefault('_mission_conversations', {})[session_id] = state
+        if not result.handled or state is None:
             _save_response(session_id, 'I can answer that as a normal conversation. What outcome would you like help with?', 'general')
             return
-        store = st.session_state.setdefault('_mission_state_store', mission_intelligence.MissionStateStore())
-        prior = store.get(session_id)
-        if prior is not None and prior.original_objective == mission.original_objective:
-            mission = prior
-        else:
-            store.save(session_id, mission)
-        summary = mission_intelligence.summarize_mission(mission)
+        summary = result.summary or mission_conversation.describe_state(state)
+        prior_response = any(item.get('role') == 'assistant' and item.get('message_type') == 'mission'
+                             and item.get('content') == summary for item in history_messages)
+        if prior_response:
+            return
         st.info(summary)
         _save_response(session_id, summary, 'mission')
+        for task in state.plan.tasks:
+            with st.expander(f"Task approval: {task.task_id}", expanded=False):
+                st.write(task.description)
+                st.write(f"Proposed agent: {task.proposed_agent or 'Unavailable'}")
+                st.write(f"Required permissions: {', '.join(task.required_permissions) or 'none declared'}")
+                if task.missing_prerequisites:
+                    st.warning('Unavailable or missing: ' + '; '.join(task.missing_prerequisites))
+                approval = state.approvals.get(task.task_id)
+                if approval:
+                    current_decision = approval[1]
+                    st.caption('Approval status: ' + (current_decision.status.value if current_decision else 'Pending explicit decision'))
+                if task.proposed_agent is not None and not approval:
+                    if st.button('Review approval request', key=f'mission_approval_review_{task.task_id}'):
+                        try:
+                            mission_conversation.create_approval_request(state, task.task_id)
+                            st.rerun()
+                        except mission_conversation.MissionConversationError as error:
+                            st.error(str(error))
+                elif approval and approval[1] is None:
+                    approve_col, reject_col = st.columns(2)
+                    if approve_col.button('Approve this task', key=f'mission_approve_{task.task_id}'):
+                        try:
+                            mission_conversation.decide_approval(
+                                state, task.task_id, approved=True,
+                                human_identity='chat-user', reason='Explicit user approval from mission review UI')
+                            st.rerun()
+                        except mission_conversation.MissionConversationError as error:
+                            st.error(str(error))
+                    if reject_col.button('Reject this task', key=f'mission_reject_{task.task_id}'):
+                        try:
+                            mission_conversation.decide_approval(
+                                state, task.task_id, approved=False,
+                                human_identity='chat-user', reason='Explicit user rejection from mission review UI')
+                            st.rerun()
+                        except mission_conversation.MissionConversationError as error:
+                            st.error(str(error))
+        return
+    if route.intent == 'mission_status':
+        from brain_core import mission_conversation
+        mission_state = st.session_state.get('_mission_conversations', {}).get(session_id)
+        if mission_state is None:
+            stored = conversation.load_mission_state(session_id, data_dir=studio.DATA, db_path=studio.DB)
+            if stored:
+                try:
+                    mission_state = mission_conversation.state_from_dict(stored[0])
+                    st.session_state.setdefault('_mission_conversations', {})[session_id] = mission_state
+                except mission_conversation.MissionConversationError:
+                    mission_state = None
+        if mission_state is None:
+            answer = 'There is no active mission plan in this conversation. You can describe a goal and I will help plan it.'
+        else:
+            answer = mission_conversation.describe_state(mission_state)
+        _save_response(session_id, answer, 'mission_status')
         return
     if route.intent == 'capability_acknowledgement':
         from brain_core.capability_communication import CapabilityUpdateStore, store_path

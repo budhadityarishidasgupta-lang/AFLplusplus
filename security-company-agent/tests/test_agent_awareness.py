@@ -9,32 +9,48 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from brain_core import agent_awareness, conversation
+from capability_report_fixtures import valid_report
 from control_plane.agent_discovery import AgentDiscovery
 from control_plane.capability_verification import verification_report
 
 
-def valid_report():
-    discovery = AgentDiscovery()
-    report = verification_report(discovery, workspace=ROOT.parent.parent)
-    for state in report['capability_states']:
-        if state['reason'] is None:
-            state['reason'] = 'Static metadata evidence verified; execution integration remains unavailable.'
-    state_lookup = {(state['agent'], state['capability']): state['state'] for state in report['capability_states']}
-    for item in report['agents']:
-        for capability in item['capabilities']:
-            capability['status'] = state_lookup[(item['identity'], capability['capability'])]
-        item['purpose'] = {
-            'multi-agent.local-recon': 'Inspect local Python source and create a fuzzing plan.',
-            'multi-agent.evolutionary-exploit-dev': 'Generate and mutate payloads in a local simulated workflow.',
-            'enterprise-range.system-architect': 'Coordinate bounded campaign state and approval gates.',
-        }[item['identity']]
-    verified_state = next((state for state in report['capability_states'] if state['state'] == 'verified'), None)
-    if verified_state:
-        verified_state['reason'] = 'Static metadata evidence verified; execution integration remains unavailable.'
-    report['capability_states'] = [
-        {**state, 'readiness': False} for state in report['capability_states']
-    ]
-    return report
+def test_verification_report_adapter_preserves_static_states_and_denies_authority():
+    raw = verification_report(AgentDiscovery(), workspace=ROOT.parent.parent)
+    adapted = agent_awareness.adapt_verification_report(raw)
+    assert adapted["schema_version"] == 1
+    assert adapted["execution_verified"] is False
+    assert adapted["permissions_granted"] is False
+    assert all(not agent["execution_readiness"]["ready"] for agent in adapted["agents"])
+    assert all(not capability["execution_readiness"]["ready"] for agent in adapted["agents"]
+               for capability in agent["capabilities"])
+    original_states = {(item["agent"], item["capability"]): item["state"]
+                       for item in raw["capability_states"]}
+    adapted_states = {(agent["identity"], capability["capability"]): capability["status"]
+                      for agent in adapted["agents"] for capability in agent["capabilities"]}
+    assert adapted_states == original_states
+
+
+def test_verification_report_adapter_rejects_missing_fields_and_unknown_states():
+    raw = verification_report(AgentDiscovery(), workspace=ROOT.parent.parent)
+    missing = dict(raw)
+    missing.pop("capability_states")
+    with pytest.raises(agent_awareness.CapabilityReportError):
+        agent_awareness.adapt_verification_report(missing)
+    unknown = json.loads(json.dumps(raw))
+    unknown["capability_states"][0]["state"] = "invented-state"
+    with pytest.raises(agent_awareness.CapabilityReportError):
+        agent_awareness.adapt_verification_report(unknown)
+
+
+def test_verification_report_adapter_rejects_permission_escalation():
+    raw = verification_report(AgentDiscovery(), workspace=ROOT.parent.parent)
+    raw["permissions_granted"] = True
+    with pytest.raises(agent_awareness.CapabilityReportError):
+        agent_awareness.adapt_verification_report(raw)
+    raw = verification_report(AgentDiscovery(), workspace=ROOT.parent.parent)
+    raw["capability_states"][0]["readiness"] = True
+    with pytest.raises(agent_awareness.CapabilityReportError):
+        agent_awareness.adapt_verification_report(raw)
 
 
 def test_reads_valid_capability_report_mapping_and_file(tmp_path):
@@ -95,6 +111,7 @@ def test_natural_question_variants_route_to_agent_awareness():
 
 def test_answers_use_verified_data_without_internal_source_details():
     report = valid_report()
+    report['agents'][0]['purpose'] = 'Inspect local Python source and create a fuzzing plan.'
     response = agent_awareness.answer_agent_question('What can my agents do?', report)
     assert 'declared capabilities' in response
     assert 'static verification' in response
@@ -104,9 +121,13 @@ def test_answers_use_verified_data_without_internal_source_details():
 
 
 def test_known_agent_answer_is_grounded_and_not_a_claim_of_authority():
-    response = agent_awareness.answer_agent_question('Which agents do you know?', valid_report())
-    assert '3 specialist agents' in response
-    assert 'local Python source' in response
+    report = valid_report()
+    response = agent_awareness.answer_agent_question('What can my agents do?', report)
+    assert 'declared capabilities' in response
+    assert 'static verification' in response
+    assert "haven't verified that I can command them" in response
+    assert all(capability["description"].startswith("Declared capability:")
+               for agent in report["agents"] for capability in agent["capabilities"])
     command = agent_awareness.answer_agent_question('Can you command the security agents?', valid_report())
     assert command.startswith('No.')
     assert 'does not grant permission' in command

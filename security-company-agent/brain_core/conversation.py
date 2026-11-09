@@ -28,6 +28,12 @@ def classify_intent(text: str) -> Route:
     body = (text or '').strip()
     folded = body.casefold()
     negated_training = _has_negated_training_intent(folded)
+    mission_status_request = re.search(
+        r'\b(?:what is your plan|show (?:me )?(?:the )?plan|what tasks require approval|'
+        r'which tasks require approval|what have (?:your|the) agents completed|'
+        r'what remains unfinished|what is unfinished|which agent can help me accomplish this)\b', folded)
+    if mission_status_request:
+        return Route('mission_status', 'explicit', 'Read-only request for the current mission plan or status.')
 
     # A clearly requested analysis or read-only recall is never a training submission,
     # even if the request mentions memory, lesson labels, or a pending training workflow.
@@ -74,15 +80,14 @@ def classify_intent(text: str) -> Route:
         r'missing capabilities|what is missing)\b', folded))
     if awareness and not negated_training:
         return Route('agent_awareness', 'explicit', 'Read-only question about discovered agent capabilities.')
-
     # Explicit objectives are distinguished from factual questions before the
     # general fallback. Mission parsing itself remains a separate service.
     from .mission_intelligence import classify_mission_intent
     mission_kind = classify_mission_intent(body)
     explicit_goal = bool(re.search(
         r'\b(please|i need|i want|help me|my goal|my objective|plan|design|organize|prepare|build|create|develop|implement|migrate|upgrade|set up|configure|diagnose|troubleshoot|audit|assess)\b',
-        folded) or (mission_kind == 'information_gathering' and re.match(
-            r'^(?:research|investigate|compare|evaluate|recommend|find|identify|look up)\b', folded)))
+        folded) or re.match(
+            r'^(?:research|investigate|compare|evaluate|recommend|find|identify|look up)\b', folded))
     research_in_situational_context = bool(
         re.search(r'\b(current|currently|recent|recently|latest|news|research|source|sources|evidence|study|studies|statistics|policy|policies|law|laws|regulation|regulations)\b', folded)
         and re.search(r'\b(i feel|i am worried|i\'m worried|my friend|my colleague|conversation)\b', folded))
@@ -91,7 +96,7 @@ def classify_intent(text: str) -> Route:
         r'\b(please|i need|i want|help me|my goal|my objective|research|investigate|compare|evaluate|recommend|find|identify|look up)\b',
         folded)
     if (mission_kind != 'ordinary' and explicit_goal and not research_in_situational_context
-            and not action_planning_language and not non_explicit_information_request
+            and (not non_explicit_information_request or action_planning_language)
             and not re.search(r'\bdo not\b', folded)
             and not re.search(
                 r'\b(approved lessons|what do you remember|recall|i want to teach|teach you|training lesson|'
@@ -251,6 +256,9 @@ def _ensure_chat_schema(db):
     db.execute('''CREATE TABLE IF NOT EXISTS conversation_lesson_state (
         conversation_id TEXT PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
         state_json TEXT NOT NULL, updated_at TEXT NOT NULL)''')
+    db.execute('''CREATE TABLE IF NOT EXISTS conversation_mission_state (
+        conversation_id TEXT PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        state_json TEXT NOT NULL, request_key TEXT NOT NULL, updated_at TEXT NOT NULL)''')
 
 
 def create_session(title='New conversation', *, data_dir=None, db_path=None):
@@ -293,6 +301,32 @@ def load_lesson_state(conversation_id, *, data_dir=None, db_path=None):
         row = db.execute('SELECT state_json FROM conversation_lesson_state WHERE conversation_id=?',
                          (conversation_id,)).fetchone()
     return studio.json.loads(row[0]) if row else None
+
+
+def save_mission_state(conversation_id, state, request_key, *, data_dir=None, db_path=None):
+    """Store one validated mission state, bound to its originating conversation."""
+    if not isinstance(state, dict) or not isinstance(request_key, str) or not request_key:
+        raise ValueError('Mission state and request key are required.')
+    with studio.connect(initialize=False, data_dir=data_dir, db_path=db_path) as db:
+        _ensure_chat_schema(db)
+        if not db.execute('SELECT 1 FROM conversations WHERE conversation_id=?', (conversation_id,)).fetchone():
+            raise ValueError('Conversation does not exist.')
+        db.execute('''INSERT OR IGNORE INTO conversation_mission_state
+                      (conversation_id,state_json,request_key,updated_at) VALUES(?,?,?,?)''',
+                   (conversation_id, studio.json.dumps(state, ensure_ascii=False), request_key, studio.now()))
+        row = db.execute('SELECT state_json,request_key FROM conversation_mission_state WHERE conversation_id=?',
+                         (conversation_id,)).fetchone()
+    return studio.json.loads(row[0]), row[1], row[1] == request_key
+
+
+def load_mission_state(conversation_id, *, data_dir=None, db_path=None):
+    if not _target(data_dir, db_path).exists():
+        return None
+    with studio.connect(initialize=False, data_dir=data_dir, db_path=db_path) as db:
+        _ensure_chat_schema(db)
+        row = db.execute('SELECT state_json,request_key FROM conversation_mission_state WHERE conversation_id=?',
+                         (conversation_id,)).fetchone()
+    return (studio.json.loads(row[0]), row[1]) if row else None
 
 
 def list_sessions(*, data_dir=None, db_path=None, limit=100):
