@@ -75,6 +75,7 @@ class CloudOrchestrator:
     def __init__(self, *, consent: CloudApprovalManager,
                  payload_factory: Callable[..., tuple[Any, str, dict, dict]],
                  provider_factory: Callable[..., Any], api_key: Callable[[], str],
+                 provider_identity: str | None = None,
                  provider_payload: Callable[[dict, Any], dict] | None = None,
                  provider_fingerprint: Callable[[Any, dict], str] | None = None,
                  result_writer: Callable[..., Any] | None = None,
@@ -93,6 +94,11 @@ class CloudOrchestrator:
         self._result_writer = result_writer
         self._result_accountant = result_accountant
         self._provider = provider or self.PROVIDER
+        if not isinstance(self._provider, str) or not self._provider.strip():
+            raise ValueError('Cloud provider identity is required.')
+        self._provider_identity = provider_identity or self._provider
+        if self._provider_identity != self._provider:
+            raise ValueError('Cloud provider identity must match the selected provider.')
         self._region = region
         self._provider_settings_mode = provider_settings is not None or provider == 'openai_cloud'
         self._provider_settings = provider_settings
@@ -137,8 +143,11 @@ class CloudOrchestrator:
                     payload, schema = self._payload_factory(
                         user_text, profile, approved_lessons, session_id=conversation_id)
                 endpoint = settings.endpoint
-            if not getattr(settings, 'configured', False) or not getattr(settings, 'api_key_configured', False):
-                raise CloudOrchestrationError('Cloud configuration is incomplete.')
+            configured_provider = getattr(settings, 'provider', None)
+            if (not getattr(settings, 'configured', False)
+                    or not getattr(settings, 'api_key_configured', False)
+                    or (configured_provider is not None and configured_provider != self._provider_identity)):
+                raise CloudOrchestrationError('Cloud configuration is incomplete or belongs to another provider.')
             parsed = urlsplit(endpoint)
             if self._provider == 'openai_cloud':
                 endpoint_ok = (endpoint == 'https://api.openai.com/v1/responses'
@@ -152,6 +161,13 @@ class CloudOrchestrator:
                                and bool(parsed.hostname))
             if not endpoint_ok:
                 raise CloudOrchestrationError('Cloud endpoint is not a valid approved HTTPS endpoint.')
+            if self._provider == 'alibaba_qwen_cloud' and self._provider_settings_mode:
+                if (configured_provider != self._provider_identity
+                        or endpoint != getattr(settings, 'endpoint', None)
+                        or type(getattr(settings, 'max_output_tokens', None)) is not int
+                        or not 1 <= settings.max_output_tokens <= 768
+                        or not 1 <= self._request_timeout_seconds <= 180):
+                    raise CloudOrchestrationError('Alibaba provider limits or endpoint are invalid.')
             frozen_payload = json.loads(json.dumps(payload, ensure_ascii=False))
             if self._provider == 'openai_cloud' and not isinstance(frozen_payload, dict):
                 raise CloudOrchestrationError('OpenAI payload must be an object.')
@@ -261,7 +277,7 @@ class CloudOrchestrator:
                 serialized = json.dumps(frozen_payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
                 tokens = self._token_counter(serialized)
             approval = self._consent.prepare(
-                provider=self._provider, model=settings.model, region=getattr(settings, 'region', self._region),
+                provider=self._provider_identity, model=settings.model, region=getattr(settings, 'region', self._region),
                 payload=approval_payload, session_id=conversation_id,
                 token_estimate=tokens, prompt_tokens=tokens,
                 estimated_cost_usd=None,
@@ -302,7 +318,7 @@ class CloudOrchestrator:
     def _retire_registered(self, approval, payload, conversation_id: str) -> None:
         try:
             self._consent.consume(
-                approval.approval_id, provider=approval.provider, model=approval.model,
+                approval.approval_id, provider=self._provider_identity, model=approval.model,
                 region=approval.region, payload=payload, session_id=conversation_id,
                 user_approved=False)
         except PermissionError:
@@ -339,16 +355,24 @@ class CloudOrchestrator:
                                           diagnostic='authorization') from error
         approved_payload = payload
         fingerprint, canonical = self._consent.fingerprint(
-            request.provider, request.model, request.region, approved_payload)
+            self._provider_identity, request.model, request.region, approved_payload)
         preview_fingerprint, preview_canonical = self._consent.fingerprint(
-            request.provider, request.model, request.region, request.preview)
+            self._provider_identity, request.model, request.region, request.preview)
         payload_canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
         preview_payload_canonical = json.dumps(request.preview, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
         identity_matches = (active_settings.model == request.model
                             and getattr(active_settings, 'region', self._region) == request.region
                             and getattr(active_settings, 'configured', False)
-                            and getattr(active_settings, 'api_key_configured', False))
-        if (fingerprint != request.fingerprint or payload_canonical != preview_payload_canonical
+                            and getattr(active_settings, 'api_key_configured', False)
+                            and (self._provider != 'alibaba_qwen_cloud'
+                                 or (not self._provider_settings_mode
+                                     and not hasattr(active_settings, 'endpoint'))
+                                 or (getattr(active_settings, 'endpoint', None) == request.endpoint
+                                     and isinstance(getattr(active_settings, 'api_key', None), str)
+                                     and isinstance(self._api_key(), str)
+                                     and hmac.compare_digest(active_settings.api_key, self._api_key()))))
+        if (request.provider != self._provider_identity
+                or fingerprint != request.fingerprint or payload_canonical != preview_payload_canonical
                 or fingerprint != preview_fingerprint or not identity_matches):
             try:
                 with self._lock:
@@ -388,7 +412,7 @@ class CloudOrchestrator:
                 provider_payload = self._provider_request_payload(payload, inference)
                 approved_provider_payload = payload
             provider_fingerprint_data = self._consent.fingerprint(
-                request.provider, request.model, request.region, provider_payload)
+                self._provider_identity, request.model, request.region, provider_payload)
             payload_matches = (provider_payload.get('model') == request.model
                                and provider_fingerprint_data[0] == request.fingerprint
                                and json.loads(provider_fingerprint_data[1])['payload'] == request.preview
@@ -406,7 +430,7 @@ class CloudOrchestrator:
             # Consume immediately before provider construction and I/O. No provider
             # boundary is called before this succeeds.
             self._consent.consume(
-                request.approval_id, provider=request.provider, model=request.model,
+                request.approval_id, provider=self._provider_identity, model=request.model,
                 region=request.region, payload=(provider_payload if self._provider == 'openai_cloud' else payload),
                 session_id=conversation_id,
                 user_approved=True, success=False, error_category='execution_started', finalize=False)
@@ -431,7 +455,7 @@ class CloudOrchestrator:
                     raise CloudOrchestrationError(
                         'Provider configuration changed; authorization remains consumed.',
                         diagnostic='authorization')
-            current_api_key = (active_settings.api_key if self._provider == 'openai_cloud'
+            current_api_key = (active_settings.api_key if self._provider in ('openai_cloud', 'alibaba_qwen_cloud')
                                and self._settings_factory is not None else self._api_key())
             provider_kwargs = {
                 'base_url': request.endpoint, 'model': request.model, 'region': request.region,
@@ -439,6 +463,24 @@ class CloudOrchestrator:
                 'timeout_seconds': self._request_timeout_seconds,
                 'max_output_tokens': request.max_output_tokens,
             }
+            if self._provider == 'alibaba_qwen_cloud' and self._provider_settings_mode:
+                try:
+                    if (getattr(active_settings, 'provider', None) != self._provider_identity
+                            or active_settings.endpoint != request.endpoint
+                            or not isinstance(active_settings.api_key, str)
+                            or not isinstance(current_api_key, str)
+                            or not hmac.compare_digest(active_settings.api_key, current_api_key)):
+                        raise CloudOrchestrationError(
+                            'Provider configuration changed; authorization remains consumed.',
+                            diagnostic='authorization')
+                    provider_kwargs['timeout_seconds'] = min(
+                        self._request_timeout_seconds, active_settings.timeout_seconds)
+                    provider_kwargs['max_output_tokens'] = min(
+                        request.max_output_tokens, active_settings.max_output_tokens)
+                except AttributeError as error:
+                    raise CloudOrchestrationError(
+                        'Provider configuration is incomplete; authorization remains consumed.',
+                        diagnostic='authorization') from error
             if self._provider == 'openai_cloud':
                 provider_kwargs = {
                     'model': request.model, 'api_key': current_api_key,

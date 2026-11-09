@@ -38,6 +38,8 @@ class ModelConfig:
     keep_alive_seconds: int | None = None
 
     def __post_init__(self):
+        if not isinstance(self.base_url, str):
+            raise ModelError('Model endpoint must be an absolute URL.')
         parsed = urlsplit(self.base_url)
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ModelError('Model endpoint must not contain credentials, query strings or fragments.')
@@ -87,10 +89,27 @@ class AlibabaConfiguration:
     model: str
     api_key_configured: bool
     errors: tuple[str, ...]
+    timeout_seconds: float = 60
+    max_output_tokens: int = 768
+    context_tokens: int = 12000
+
+    @property
+    def api_key(self):
+        """Never retain credentials on a printable configuration object."""
+        return os.getenv('DASHSCOPE_API_KEY', '').strip() or None
 
     @property
     def configured(self):
         return not self.errors
+
+    def __repr__(self):
+        return (f'AlibabaConfiguration(provider={self.provider!r}, region={self.region!r}, '
+                f'workspace_id={self.workspace_id!r}, endpoint={self.endpoint!r}, model={self.model!r}, '
+                f'api_key_configured={self.api_key_configured!r}, errors={self.errors!r}, '
+                f'timeout_seconds={self.timeout_seconds!r}, max_output_tokens={self.max_output_tokens!r}, '
+                f'context_tokens={self.context_tokens!r})')
+
+    __str__ = __repr__
 
 
 def alibaba_configuration():
@@ -100,35 +119,84 @@ def alibaba_configuration():
     model = (os.getenv('SOVEREIGN_ALIBABA_MODEL') or os.getenv('ALIBABA_QWEN_MODEL') or '').strip()
     endpoint = (os.getenv('SOVEREIGN_ALIBABA_BASE_URL') or os.getenv('ALIBABA_BASE_URL') or '').strip()
     key = os.getenv('DASHSCOPE_API_KEY', '').strip()
-    key_present = bool(key and not key.startswith('PASTE_YOUR_'))
+    key_present = bool(key and not key.upper().startswith(('PASTE_', 'YOUR_', 'REPLACE_')))
     errors = []
-    if region.startswith('YOUR_'):
+    region_ids = {
+        'cn-beijing': 'cn-beijing', 'beijing': 'cn-beijing',
+        'ap-southeast-1': 'ap-southeast-1', 'singapore': 'ap-southeast-1',
+        'us-east-1': 'us-east-1', 'us-virginia': 'us-east-1', 'virginia': 'us-east-1',
+        'cn-hongkong': 'cn-hongkong', 'hong-kong': 'cn-hongkong', 'hong kong': 'cn-hongkong',
+        'ap-northeast-1': 'ap-northeast-1', 'tokyo': 'ap-northeast-1',
+        'eu-central-1': 'eu-central-1', 'frankfurt': 'eu-central-1', 'germany-frankfurt': 'eu-central-1',
+    }
+    if region.upper().startswith(('YOUR_', 'PASTE_', 'REPLACE_')):
         region = ''
-    if workspace.startswith('YOUR_'):
+    else:
+        region = region_ids.get(region.casefold(), region)
+    if workspace.upper().startswith(('YOUR_', 'PASTE_', 'REPLACE_')):
         workspace = ''
-    if model.startswith('YOUR_'):
+    if model.upper().startswith(('YOUR_', 'PASTE_', 'REPLACE_')):
         model = ''
-    if endpoint.startswith('YOUR_'):
+    if endpoint.upper().startswith(('YOUR_', 'PASTE_', 'REPLACE_')):
         endpoint = ''
     if not region:
-        errors.append('Alibaba region is not configured.')
-    if not workspace:
-        errors.append('Alibaba workspace ID is not configured.')
-    if not model:
-        errors.append('Alibaba Qwen model is not configured.')
+        errors.append('Alibaba region is not configured or is unsupported.')
+    elif region not in {'cn-beijing', 'ap-southeast-1', 'us-east-1', 'cn-hongkong', 'ap-northeast-1', 'eu-central-1'}:
+        errors.append('Alibaba region is unsupported; configure a documented Model Studio region ID.')
+    if (not workspace or len(workspace) > 128
+            or any(not (char.isalnum() or char in '-_') for char in workspace)):
+        errors.append('Alibaba workspace ID is not configured or invalid.')
+    if (not model or len(model) > 120 or any(ord(char) < 32 for char in model)
+            or any(char in model for char in ('/', '\\', '?', '#'))):
+        errors.append('Alibaba Qwen model is not configured or invalid.')
     if not key_present:
         errors.append('Alibaba API key is not configured.')
-    endpoint_region = {'singapore': 'ap-southeast-1'}.get(region.casefold(), region)
+
+    if key_present and any(ord(char) < 32 for char in key):
+        key_present = False
+        key = ''
+        errors.append('Alibaba API key configuration is invalid.')
+
+    # Model Studio endpoints and region-specific keys are not interchangeable.
+    # Use the documented workspace-dedicated domain, including Frankfurt.
+    endpoint_region = region
     if not endpoint and endpoint_region and workspace:
         endpoint = f'https://{workspace}.{endpoint_region}.maas.aliyuncs.com/compatible-mode/v1'
     if endpoint:
-        parsed = urlsplit(endpoint)
-        expected = f'{workspace}.{endpoint_region}.maas.aliyuncs.com'.casefold() if endpoint_region and workspace else None
-        if (parsed.scheme != 'https' or parsed.username or parsed.password or parsed.port is not None or
-                parsed.query or parsed.fragment or parsed.path.rstrip('/') != '/compatible-mode/v1' or
-                (expected and parsed.hostname and parsed.hostname.casefold() != expected)):
+        try:
+            parsed = urlsplit(endpoint)
+            expected = f'{workspace}.{endpoint_region}.maas.aliyuncs.com'.casefold() if endpoint_region and workspace else None
+            valid = (parsed.scheme == 'https' and parsed.username is None and parsed.password is None
+                     and parsed.port is None and not parsed.query and not parsed.fragment
+                     and parsed.path.rstrip('/') == '/compatible-mode/v1'
+                     and bool(parsed.hostname) and parsed.hostname.casefold() == expected)
+        except (ValueError, AttributeError):
+            valid = False
+        if not valid:
             errors.append('Alibaba endpoint must be HTTPS and match the configured workspace and region.')
-    return AlibabaConfiguration('alibaba_qwen_cloud', region, workspace, endpoint, model, key_present, tuple(errors))
+    try:
+        timeout_value = float(os.getenv('SOVEREIGN_ALIBABA_TIMEOUT_SECONDS', '60'))
+        if not 1 <= timeout_value <= 180:
+            raise ValueError
+    except (ValueError, OverflowError):
+        timeout_value = 60
+        errors.append('Alibaba request timeout must be between 1 and 180 seconds.')
+    try:
+        max_output = int(os.getenv('SOVEREIGN_ALIBABA_MAX_OUTPUT_TOKENS', '768'))
+        if not 1 <= max_output <= 768:
+            raise ValueError
+    except (ValueError, OverflowError):
+        max_output = 768
+        errors.append('SOVEREIGN_ALIBABA_MAX_OUTPUT_TOKENS must be between 1 and 768.')
+    try:
+        context_tokens = int(os.getenv('SOVEREIGN_ALIBABA_CONTEXT_TOKENS', '12000'))
+        if not 1 <= context_tokens <= 12000:
+            raise ValueError
+    except (ValueError, OverflowError):
+        context_tokens = 12000
+        errors.append('SOVEREIGN_ALIBABA_CONTEXT_TOKENS must be between 1 and 12000.')
+    return AlibabaConfiguration('alibaba_qwen_cloud', region, workspace, endpoint, model, key_present,
+                                tuple(errors), timeout_value, max_output, context_tokens)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):

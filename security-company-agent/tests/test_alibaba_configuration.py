@@ -122,6 +122,55 @@ class AlibabaConfigurationTests(unittest.TestCase):
             config = self.read()
         self.assertEqual(config.provider, 'alibaba_qwen_cloud')
 
+    def test_frankfurt_uses_workspace_dedicated_eu_central_endpoint(self):
+        config = self.read(SOVEREIGN_ALIBABA_REGION='eu-central-1',
+                           SOVEREIGN_ALIBABA_WORKSPACE_ID='workspace-123',
+                           SOVEREIGN_ALIBABA_MODEL='account-model', DASHSCOPE_API_KEY='synthetic')
+        self.assertTrue(config.configured, config.errors)
+        self.assertEqual(config.endpoint,
+                         'https://workspace-123.eu-central-1.maas.aliyuncs.com/compatible-mode/v1')
+        self.assertEqual(config.region, 'eu-central-1')
+
+    def test_frankfurt_rejects_international_singapore_endpoint(self):
+        config = self.read(SOVEREIGN_ALIBABA_REGION='eu-central-1',
+                           SOVEREIGN_ALIBABA_WORKSPACE_ID='workspace-123',
+                           SOVEREIGN_ALIBABA_MODEL='account-model', DASHSCOPE_API_KEY='synthetic',
+                           SOVEREIGN_ALIBABA_BASE_URL='https://dashscope-intl.aliyuncs.com/compatible-mode/v1')
+        self.assertFalse(config.configured)
+        self.assertTrue(any('endpoint' in error for error in config.errors))
+
+    def test_region_alias_and_placeholders_are_normalized_safely(self):
+        config = self.read(SOVEREIGN_ALIBABA_REGION='Frankfurt',
+                           SOVEREIGN_ALIBABA_WORKSPACE_ID='YOUR_WORKSPACE_ID',
+                           SOVEREIGN_ALIBABA_MODEL='PASTE_MODEL', DASHSCOPE_API_KEY='PASTE_YOUR_KEY')
+        self.assertEqual(config.region, 'eu-central-1')
+        self.assertFalse(config.configured)
+        self.assertFalse(config.api_key_configured)
+
+    def test_api_key_is_available_for_transport_without_being_stored_in_config(self):
+        secret = 'synthetic-key-for-transport'
+        with patch.dict(os.environ, {
+                'SOVEREIGN_ALIBABA_REGION': 'eu-central-1',
+                'SOVEREIGN_ALIBABA_WORKSPACE_ID': 'workspace-123',
+                'SOVEREIGN_ALIBABA_MODEL': 'account-model',
+                'DASHSCOPE_API_KEY': secret}, clear=False):
+            config = alibaba_configuration()
+            self.assertEqual(config.api_key, secret)
+            self.assertEqual(config.api_key_configured, bool(secret))
+            self.assertEqual(os.environ['DASHSCOPE_API_KEY'], secret)
+        self.assertNotIn(secret, repr(config))
+
+    def test_invalid_account_model_limits_and_timeout_fail_configuration(self):
+        env = {'SOVEREIGN_ALIBABA_REGION': 'eu-central-1',
+               'SOVEREIGN_ALIBABA_WORKSPACE_ID': 'workspace-123',
+               'SOVEREIGN_ALIBABA_MODEL': 'model/invalid', 'DASHSCOPE_API_KEY': 'synthetic',
+               'SOVEREIGN_ALIBABA_TIMEOUT_SECONDS': 'not-a-number'}
+        with patch.dict(os.environ, env, clear=False):
+            config = alibaba_configuration()
+        self.assertFalse(config.configured)
+        self.assertTrue(any('model' in error.lower() for error in config.errors))
+        self.assertTrue(any('timeout' in error.lower() for error in config.errors))
+
 
 if __name__ == '__main__':
     unittest.main()

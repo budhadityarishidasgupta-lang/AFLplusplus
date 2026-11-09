@@ -61,6 +61,27 @@ class Step8LTests(unittest.TestCase):
         manager.consume(approval.approval_id,provider='alibaba_qwen_cloud',model='qwen-plus',region='singapore',payload=payload,session_id='s',user_approved=True,success=False)
         self.assertEqual(len(manager.events),1)
 
+    def test_approved_research_is_explicitly_separated_and_sanitized_for_cloud(self):
+        from brain_core.evidence_context import build_evidence_context
+        from brain_core.research_evidence import ResearchEvidence
+        evidence = ResearchEvidence(
+            claim='Synthetic public claim.', snippet='Synthetic public excerpt.',
+            source_url='https://example.invalid/reference', title='Synthetic source',
+            retrieved_at='2026-01-01T00:00:00Z', confidence=0.1,
+            uncertainty='Unverified source claim.', content_trusted=False)
+        bundle = build_evidence_context([evidence])
+        context = sanitized_cloud_context(
+            scenario='Synthetic question', identity_name='Synthetic', identity_mission='',
+            approved_lessons=[], evidence_bundle=bundle)
+        self.assertEqual(context['external_evidence']['trust'], 'untrusted_external_data')
+        self.assertEqual(len(context['external_evidence']['items']), 1)
+        self.assertNotIn('retrieved_at', context['external_evidence']['items'][0])
+        self.assertNotIn('Synthetic source', json.dumps(context['personality']))
+        with self.assertRaises(ValueError):
+            sanitized_cloud_context(scenario='Synthetic', identity_name='Synthetic',
+                                    identity_mission='', approved_lessons=[],
+                                    evidence_bundle=object())
+
     def test_approval_once_exact_payload_and_rerun_idempotence(self):
         mgr=CloudApprovalManager(); payload={'messages':[{'role':'user','content':'synthetic'}]}
         approval=mgr.prepare(provider='alibaba_qwen_cloud',model='qwen',region='region',payload=payload,session_id='s',token_estimate=100,budget=CloudBudget()); mgr.register(approval)
@@ -100,6 +121,17 @@ class Step8LTests(unittest.TestCase):
         serialized=json.dumps(envelope)
         self.assertIn('lesson-5',serialized); self.assertIn('human_supervised',serialized)
         self.assertNotIn('unrelated archive',serialized); self.assertIn(SCENARIO,envelope['scenario'])
+
+    def test_context_minimization_blocks_credential_material_and_unbounded_memory(self):
+        for secret in ('api_key=synthetic-private-value', 'Bearer synthetic-private-token',
+                       '-----BEGIN PRIVATE KEY-----'):
+            with self.subTest(secret=secret):
+                with self.assertRaises(ValueError):
+                    sanitized_cloud_context(scenario=secret, identity_name='Synthetic',
+                                            identity_mission='', approved_lessons=[])
+        with self.assertRaises(ValueError):
+            sanitized_cloud_context(scenario='Synthetic', identity_name='Synthetic',
+                                    identity_mission='', approved_lessons=None)
 
     def test_regional_endpoint_mismatch_rejected(self):
         with self.assertRaises(ValueError): AlibabaQwenProvider(base_url='https://workspace.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1',model='q',region='cn-hangzhou',api_key='test',allowed_hosts=('workspace.cn-hangzhou.maas.aliyuncs.com',))

@@ -27,11 +27,10 @@ class ProviderSelection:
 
 
 def select_provider(*, local_readiness=None, openai_readiness=None, alibaba_readiness=None):
-    """Prefer a ready local provider, else configured OpenAI; Alibaba is deferred.
+    """Select a provider from explicit local readiness/configuration only.
 
-    Readiness arguments are injectable for offline tests. When omitted, the
-    existing read-only readiness checks are used. Alibaba readiness is
-    intentionally ignored until a later selection policy includes it.
+    This helper does not grant cloud consent and must never initiate inference.
+    Alibaba remains explicitly selectable in the UI, not an automatic fallback.
     """
     if local_readiness is None:
         from .model_api import check_local_readiness

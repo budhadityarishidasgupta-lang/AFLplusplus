@@ -336,6 +336,8 @@ def _schema_matches_validator(schema):
         return all(key in schema for key in ('minItems', 'maxItems')) and _schema_matches_validator(schema.get('items'))
     if kind == 'string':
         return 'minLength' in schema and 'maxLength' in schema
+    if kind == 'boolean':
+        return True
     if kind == 'number':
         return 'minimum' in schema and 'maximum' in schema
     return False

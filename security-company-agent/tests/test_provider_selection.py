@@ -50,5 +50,11 @@ class ProviderSelectionTests(unittest.TestCase):
         self.assertNotIn('leak', result.reason.value)
 
 
+    def test_alibaba_configuration_does_not_trigger_automatic_cloud_fallback(self):
+        result = select_provider(local_readiness={'status': 'UNAVAILABLE', 'reason': 'service_offline'},
+                                 openai_readiness={'status': 'UNAVAILABLE', 'reason': 'missing_key'},
+                                 alibaba_readiness={'status': 'AVAILABLE', 'reason': None})
+        self.assertIsNone(result.provider)
+
 if __name__ == '__main__':
     unittest.main()

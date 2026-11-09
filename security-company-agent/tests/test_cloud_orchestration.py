@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from brain_core.cloud_consent import CloudApprovalManager, CloudApprovalRequired
 from brain_core.cloud_orchestration import CloudOrchestrationError, CloudOrchestrator
-from brain_core.providers import InferenceResult, ProviderID
+from brain_core.providers import InferenceResult, ProviderID, sanitized_cloud_context
 
 
 @dataclass(frozen=True)
@@ -108,6 +108,42 @@ class CloudOrchestrationTests(unittest.TestCase):
         with self.assertRaises(CloudOrchestrationError) as caught:
             self.service.approve_and_execute(request=request, conversation_id='other-conversation')
         self.assertEqual(caught.exception.diagnostic, 'authorization')
+        self.assertEqual(self.provider_factory.call_count, 0)
+
+    def test_approval_provider_is_bound_to_service_provider_identity(self):
+        request = self.prepare()
+        tampered = request.__class__(
+            request.approval_id, request.fingerprint, request.conversation_id,
+            'openai_cloud', request.model, request.region, request.endpoint,
+            request.payload_json, request.token_estimate, request.max_output_tokens)
+        with self.assertRaises(CloudOrchestrationError):
+            self.service.approve_and_execute(request=tampered, conversation_id='conversation-1')
+        self.assertEqual(self.provider_factory.call_count, 0)
+        self.assertEqual(self.provider.calls, 0)
+
+    def test_request_secret_is_blocked_from_minimized_cloud_context(self):
+        for secret in ('api_key=synthetic-private-value', 'Bearer synthetic-private-token',
+                       '-----BEGIN PRIVATE KEY-----'):
+            with self.subTest(secret=secret):
+                with self.assertRaises(ValueError):
+                    sanitized_cloud_context(scenario=secret, identity_name='Synthetic',
+                                            identity_mission='', approved_lessons=[])
+        with self.assertRaises(ValueError):
+            sanitized_cloud_context(scenario='Synthetic', identity_name='Synthetic',
+                                    identity_mission='', approved_lessons=None)
+
+    def test_selected_provider_consent_cannot_be_consumed_as_another_provider(self):
+        request = self.prepare()
+        fingerprint_before = self.manager.events
+        approval = self.manager._approvals[request.approval_id]
+        self.assertEqual(approval.provider, 'alibaba_qwen_cloud')
+        self.assertNotEqual(approval.provider, 'openai_cloud')
+        self.assertEqual(fingerprint_before, ())
+        with self.assertRaises(CloudApprovalRequired):
+            self.manager.consume(request.approval_id, provider='openai_cloud',
+                                 model=request.model, region=request.region,
+                                 payload=request.preview, session_id='conversation-1',
+                                 user_approved=True)
         self.assertEqual(self.provider_factory.call_count, 0)
 
     def test_failed_provider_result_is_accounted_once_without_success(self):

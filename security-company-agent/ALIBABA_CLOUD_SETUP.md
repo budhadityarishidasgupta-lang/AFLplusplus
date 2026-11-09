@@ -11,15 +11,18 @@ $secure = Read-Host 'DashScope API key' -AsSecureString
 $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
 try { $env:DASHSCOPE_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
 finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
-$env:SOVEREIGN_ALIBABA_REGION = '<your actual Model Studio region ID>'
-$env:SOVEREIGN_ALIBABA_WORKSPACE_ID = '<workspace ID for that same region>'
-$env:SOVEREIGN_ALIBABA_MODEL = '<model ID enabled in that region/workspace>'
-# Optional. Otherwise the app constructs the documented workspace-specific URL:
-# https://{WorkspaceId}.{Region}.maas.aliyuncs.com/compatible-mode/v1
+$env:SOVEREIGN_ALIBABA_REGION = 'eu-central-1' # Germany (Frankfurt)
+$env:SOVEREIGN_ALIBABA_WORKSPACE_ID = '<your Frankfurt workspace ID>'
+$env:SOVEREIGN_ALIBABA_MODEL = '<Qwen model enabled in your Frankfurt workspace>'
+# Optional. Otherwise the app constructs the documented Frankfurt workspace URL:
+# https://{WorkspaceId}.eu-central-1.maas.aliyuncs.com/compatible-mode/v1
+$env:SOVEREIGN_ALIBABA_TIMEOUT_SECONDS = '60'
+$env:SOVEREIGN_ALIBABA_MAX_OUTPUT_TOKENS = '768'
+$env:SOVEREIGN_ALIBABA_CONTEXT_TOKENS = '12000'
 $env:SOVEREIGN_ALIBABA_BASE_URL = ''
 ```
 
-For persistent Windows user variables, configure them in Windows Environment Variables or a protected secret manager; restart Streamlit after changes. Do not save a plain-text `.env` file unless it has restrictive ACLs and is excluded from Git. Do not use the Singapore endpoint unless your workspace is actually in Singapore. The hostname must match workspace and region.
+For persistent Windows user variables, configure them in Windows Environment Variables or a protected secret manager; restart Streamlit after changes. Do not save a plain-text `.env` file unless it has restrictive ACLs and is excluded from Git. For Germany (Frankfurt), the documented workspace-specific OpenAI-compatible base URL is `https://{WorkspaceId}.eu-central-1.maas.aliyuncs.com/compatible-mode/v1`; the app appends `/chat/completions`. Do not use the Singapore `dashscope-intl.aliyuncs.com` endpoint or key for Frankfurt. Region keys, models, and workspace endpoints are not interchangeable. Consult the [official Model Studio base URL reference](https://help.aliyun.com/en/model-studio/base-url) and [Qwen Chat Completions reference](https://help.aliyun.com/en/model-studio/qwen-api-via-openai-chat-completions) for other regions. The configured model ID must actually be enabled in your workspace/region; the app does not assume or discover account model availability. Request timeout is configurable from 1 to 180 seconds; output and context budgets are capped at 768 and 12,000 tokens locally.
 
 The app needs no credential display; it reports only whether a key is configured. Model catalog presence is not proof that the workspace key can invoke that model.
 
