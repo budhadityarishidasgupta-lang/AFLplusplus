@@ -352,7 +352,10 @@ class ResultVerifier:
         uncertainties = tuple(_dedupe(value for assessment in assessments for value in assessment.uncertainties))
         evidence_refs = tuple(sorted({reference for assessment in assessments for reference in assessment.evidence_ids}))
         deliverables = tuple(sorted({value for assessment in assessments for value in assessment.verified_deliverables}))
-        limitations = ("Assessment uses supplied structured results and evidence only; no external source verification is performed.",)
+        limitations = (
+            "Assessment uses supplied structured results and evidence only; no external source verification is performed.",
+            "Structural validation does not authenticate evidence provenance or establish independent verification.",
+        )
         return MissionOutcome(mission.mission_id, status, deliverables, tuple(criteria), completed_tasks,
             incomplete_tasks, failed_tasks, evidence_refs, uncertainties, limitations, tuple(recs))
 

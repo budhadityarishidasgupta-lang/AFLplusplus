@@ -46,6 +46,8 @@ class ResultVerificationTests(unittest.TestCase):
         outcome = self.verifier.assess_mission(self.mission, (self.input,))
         self.assertEqual(outcome.status, MissionOutcomeStatus.COMPLETED_VERIFIED)
         self.assertEqual(outcome.verified_deliverables, ("deliverable.report",))
+        self.assertIn("task-1", outcome.completed_tasks)
+        self.assertTrue(any("does not authenticate" in limitation for limitation in outcome.limitations))
         json.dumps(outcome.to_dict())
         summary = outcome.brain_summary()
         json.dumps(summary)

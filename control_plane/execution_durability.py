@@ -7,6 +7,8 @@ it is never replayed automatically.
 from __future__ import annotations
 
 import hashlib
+import hmac
+import inspect
 import json
 import sqlite3
 import threading
@@ -27,6 +29,7 @@ class SQLiteExecutionStore:
         self.path = str(path)
         self._lock = threading.RLock()
         self._owner_token = uuid.uuid4().hex
+        self._completion_secret = uuid.uuid4().bytes
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -67,8 +70,12 @@ class SQLiteExecutionStore:
                 error_category TEXT,
                 error_message TEXT,
                 reconciliation TEXT,
+                reconciliation_notes_json TEXT,
                 worker_token TEXT NOT NULL
             )""")
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(execution_claims)")}
+            if "reconciliation_notes_json" not in columns:
+                db.execute("ALTER TABLE execution_claims ADD COLUMN reconciliation_notes_json TEXT")
             db.execute("CREATE INDEX IF NOT EXISTS execution_claims_state_idx ON execution_claims(state)")
         finally:
             db.close()
@@ -166,7 +173,8 @@ class SQLiteExecutionStore:
             db.close()
 
     def transition(self, task_id: str, state: str, *, result: Any = None,
-                   error_category: str | None = None, error_message: str | None = None) -> None:
+                   error_category: str | None = None, error_message: str | None = None,
+                   _engine_recorded: object | None = None) -> None:
         if not isinstance(task_id, str) or not task_id or not isinstance(state, str):
             raise DurableExecutionError("task and state are required")
         allowed = {"AUTHORIZED", "INVOKING", "COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT",
@@ -174,8 +182,10 @@ class SQLiteExecutionStore:
         if state not in allowed:
             raise DurableExecutionError("unsupported durable execution state")
         result_json = _json(result) if result is not None else None
-        if state == "COMPLETED" and result is None:
-            raise DurableExecutionError("completed execution requires a persisted result")
+        if state == "COMPLETED" and (
+            result is None or not _valid_completion_token(_engine_recorded, self._completion_secret, result)
+        ):
+            raise DurableExecutionError("completed execution requires an engine-recorded result")
         if state in {"FAILED", "CANCELLED", "TIMED_OUT", "RECONCILIATION_REQUIRED"} and result is not None:
             raise DurableExecutionError("non-success state cannot persist a success result")
         now = datetime.now(timezone.utc).isoformat()
@@ -191,7 +201,8 @@ class SQLiteExecutionStore:
                 "CLAIMED": {"AUTHORIZED", "FAILED", "CANCELLED", "RECONCILIATION_REQUIRED"},
                 "AUTHORIZED": {"INVOKING", "FAILED", "CANCELLED", "RECONCILIATION_REQUIRED"},
                 "INVOKING": {"COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "RECONCILIATION_REQUIRED"},
-                "RECONCILIATION_REQUIRED": {"COMPLETED", "FAILED"},
+                # Interrupted work cannot be promoted from an assertion or note.
+                "RECONCILIATION_REQUIRED": set(),
             }
             if state not in transitions.get(old_state, set()):
                 db.execute("ROLLBACK")
@@ -239,37 +250,56 @@ class SQLiteExecutionStore:
             db.close()
         return tuple(changed)
 
-    def reconcile(self, task_id: str, *, outcome: str, evidence: str,
-                  result: Any = None, verified: bool = False) -> None:
-        if outcome not in {"COMPLETED", "FAILED"} or not isinstance(evidence, str) or not evidence.strip():
-            raise DurableExecutionError("manual reconciliation requires a terminal outcome and evidence")
-        if verified is not True:
-            raise DurableExecutionError("manual reconciliation requires an explicit verified-evidence attestation")
-        if outcome == "COMPLETED" and result is None:
-            raise DurableExecutionError("successful reconciliation requires verified result evidence")
-        if outcome == "FAILED" and result is not None:
-            raise DurableExecutionError("failed reconciliation cannot store a success result")
-        digest = hashlib.sha256(evidence.encode("utf-8")).hexdigest()
-        verified_payload = (
-            {"reconciliation_evidence_digest": digest, "verified_result": result}
-            if outcome == "COMPLETED" else None
-        )
+    def record_reconciliation_note(self, task_id: str, note: str) -> None:
+        """Append a human observation without changing execution or verification state."""
+        if not isinstance(task_id, str) or not task_id:
+            raise DurableExecutionError("task identifier is required")
+        if not isinstance(note, str) or not note.strip() or len(note) > 2000:
+            raise DurableExecutionError("reconciliation note must be non-empty safe text")
+        if any(ord(character) < 32 and character not in "\t\n\r" for character in note):
+            raise DurableExecutionError("reconciliation note contains unsafe text")
         now = datetime.now(timezone.utc).isoformat()
         db = self._connect()
         try:
             db.execute("BEGIN IMMEDIATE")
-            cursor = db.execute("""UPDATE execution_claims SET state=?, updated_at=?,
-                result_json=?, error_category=NULL, error_message=NULL, reconciliation=?
-                WHERE task_id=? AND state='RECONCILIATION_REQUIRED'""", (
-                outcome, now, _json(verified_payload) if verified_payload is not None else None,
-                "manual reconciliation evidence sha256:" + digest, task_id,
-            ))
-            if cursor.rowcount != 1:
+            row = db.execute("SELECT state, reconciliation_notes_json FROM execution_claims WHERE task_id=?",
+                             (task_id,)).fetchone()
+            if row is None or row["state"] != "RECONCILIATION_REQUIRED":
                 db.execute("ROLLBACK")
                 raise DurableExecutionError("claim is not awaiting reconciliation")
+            notes = json.loads(row["reconciliation_notes_json"] or "[]")
+            notes.append({"recorded_at": now, "note": note})
+            db.execute("UPDATE execution_claims SET reconciliation_notes_json=?, updated_at=? WHERE task_id=?",
+                       (_json(notes), now, task_id))
             db.execute("COMMIT")
         finally:
             db.close()
+
+    def reconcile(self, task_id: str, *, outcome: str, evidence: str,
+                  result: Any = None, verified: bool = False) -> None:
+        """Deprecated fail-closed API; human attestations cannot verify execution."""
+        raise DurableExecutionError(
+            "manual reconciliation cannot promote interrupted execution; "
+            "SB-41 does not authenticate evidence provenance"
+        )
+
+    def engine_completion_token(self, result: Any) -> str:
+        """Issue a process-local token only to the execution-engine caller."""
+        frame = inspect.currentframe()
+        caller = frame.f_back if frame is not None else None
+        caller_module = caller.f_globals.get("__name__") if caller is not None else None
+        if caller_module != "control_plane.execution_engine":
+            raise DurableExecutionError("engine completion token is restricted to the execution engine")
+        payload = _json(result).encode("utf-8")
+        return hmac.new(self._completion_secret, payload, hashlib.sha256).hexdigest()
+
+
+def _valid_completion_token(token: object, secret: bytes, result: Any) -> bool:
+    if not isinstance(token, str):
+        return False
+    payload = _json(result).encode("utf-8")
+    expected = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(token, expected)
 
 
 def _authorization_matches(row: sqlite3.Row, authorization: ExecutionAuthorization) -> bool:

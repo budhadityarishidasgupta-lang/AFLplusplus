@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import time
@@ -65,9 +66,16 @@ class DurableExecutionTests(unittest.TestCase):
         authorization = self.authorize(request)
         result = self.engine.submit(request, authorization)
         self.assertEqual(result.state, ExecutionState.COMPLETED)
+        self.assertEqual(result.task_id, request.task_id)
+        self.assertEqual(result.mission_id, request.mission_id)
         claim = self.store.get_claim(request.task_id)
         self.assertEqual(claim["state"], "COMPLETED")
         self.assertEqual(claim["authorization_id"], authorization.authorization_id)
+        self.assertEqual(json.loads(claim["result_json"]), {"output": {"echo": "synthetic"}})
+        self.assertEqual(self.adapter.calls, 1)
+        # A terminal task claim and single-use authorization cannot be replayed.
+        with self.assertRaises(ExecutionError):
+            self.engine.submit(request, authorization)
         self.assertEqual(self.adapter.calls, 1)
 
     def test_duplicate_concurrent_submissions_are_at_most_once(self) -> None:
@@ -98,13 +106,39 @@ class DurableExecutionTests(unittest.TestCase):
         reopened = SQLiteExecutionStore(self.db_path)
         self.assertEqual(reopened.recover_inflight(), (request.task_id,))
         self.assertEqual(reopened.get_claim(request.task_id)["state"], "RECONCILIATION_REQUIRED")
-        restarted_issuer = ExecutionAuthorizationIssuer()
-        restarted_engine = ExecutionEngine(self.registry, restarted_issuer, durable_store=reopened)
+        reopened_issuer = ExecutionAuthorizationIssuer()
+        restarted_engine = ExecutionEngine(self.registry, reopened_issuer, durable_store=reopened)
         adapter = DurableEcho()
         restarted_engine.register_adapter(adapter)
         with self.assertRaises(ExecutionError):
             restarted_engine.submit(request, authorization)
         self.assertEqual(adapter.calls, 0)
+
+    def test_completed_engine_result_proceeds_to_structural_mission_assessment(self) -> None:
+        from control_plane.mission_planning import MissionReference, MissionTask
+        from control_plane.result_verification import Evidence, ResultVerifier, TaskVerificationInput
+
+        request = self.request()
+        result = self.engine.submit(request, self.authorize(request))
+        mission = MissionReference("mission-durable", "Echo fixture", "Echo recorded",
+                                   ("echo",), ("echo",))
+        task = MissionTask("task-durable", "Echo", ("echo",), "echo", "synthetic.durable",
+                           (), ("read-fixture",), (), (), ("echo",), True)
+        evidence = (Evidence("evidence-echo", "mission-durable", "task-durable", "criterion.echo",
+                             "synthetic result fixture", True, {"echo": "synthetic"},
+                             "caller-supplied provenance (not authenticated)"),
+                    Evidence("evidence-deliverable", "mission-durable", "task-durable", "echo",
+                             "synthetic result fixture", True, {"echo": "synthetic"},
+                             "caller-supplied provenance (not authenticated)"))
+        item = TaskVerificationInput(task, result, evidence,
+                                     agent_capabilities=("echo",),
+                                     authorized_permissions=("read-fixture",),
+                                     required_permissions=("read-fixture",))
+        outcome = ResultVerifier().assess_mission(mission, (item,))
+        self.assertEqual(outcome.status.value, "COMPLETED_VERIFIED", outcome.to_dict())
+        self.assertTrue(any("does not authenticate" in limitation for limitation in outcome.limitations))
+        self.assertEqual(self.store.get_claim(request.task_id)["state"], "COMPLETED")
+        self.assertEqual(self.adapter.calls, 1)
 
     def test_restart_during_invocation_marks_claim_uncertain(self) -> None:
         request = self.request()
@@ -114,6 +148,12 @@ class DurableExecutionTests(unittest.TestCase):
         self.store.transition(request.task_id, "INVOKING")
         restarted = SQLiteExecutionStore(self.db_path)
         self.assertEqual(restarted.recover_inflight(), (request.task_id,))
+        self.assertEqual(restarted.get_claim(request.task_id)["state"], "RECONCILIATION_REQUIRED")
+        with self.assertRaises(DurableExecutionError):
+            restarted.reconcile(request.task_id, outcome="COMPLETED", evidence="verified",
+                                result={"echo": "synthetic"}, verified=True)
+        with self.assertRaises(DurableExecutionError):
+            restarted.transition(request.task_id, "COMPLETED", result={"echo": "synthetic"})
         self.assertEqual(restarted.get_claim(request.task_id)["state"], "RECONCILIATION_REQUIRED")
 
     def test_crash_after_invoke_before_result_is_not_inferred_as_success(self) -> None:
@@ -152,7 +192,7 @@ class DurableExecutionTests(unittest.TestCase):
             self.engine.submit(mismatch_request, wrong_auth)
         self.assertEqual(self.adapter.calls, 0)
 
-    def test_manual_reconciliation_requires_evidence_and_never_retries(self) -> None:
+    def test_manual_verified_attestation_cannot_promote_interrupted_work(self) -> None:
         request = self.request()
         authorization = self.authorize(request)
         self.store.claim(request, authorization)
@@ -161,15 +201,47 @@ class DurableExecutionTests(unittest.TestCase):
         restarted = SQLiteExecutionStore(self.db_path)
         self.assertEqual(restarted.recover_inflight(), (request.task_id,))
         with self.assertRaises(DurableExecutionError):
-            self.store.reconcile(request.task_id, outcome="COMPLETED", evidence=" ", result={"echo": "x"})
-        with self.assertRaises(DurableExecutionError):
-            self.store.reconcile(request.task_id, outcome="COMPLETED", evidence="unverified claim",
-                                 result={"echo": "x"})
-        self.store.reconcile(request.task_id, outcome="COMPLETED", evidence="operator verified fixture result",
-                             result={"echo": "synthetic"}, verified=True)
+            self.store.reconcile(request.task_id, outcome="COMPLETED", evidence="operator assertion",
+                                 result={"echo": "synthetic"}, verified=True)
         claim = self.store.get_claim(request.task_id)
-        self.assertEqual(claim["state"], "COMPLETED")
-        self.assertIn("reconciliation_evidence_digest", claim["result_json"])
+        self.assertEqual(claim["state"], "RECONCILIATION_REQUIRED")
+        self.assertIsNone(claim["result_json"])
+        self.assertEqual(self.adapter.calls, 0)
+
+    def test_direct_store_call_cannot_forge_engine_recorded_marker(self) -> None:
+        request = self.request()
+        authorization = self.authorize(request)
+        self.store.claim(request, authorization)
+        self.store.transition(request.task_id, "AUTHORIZED")
+        self.store.transition(request.task_id, "INVOKING")
+        with self.assertRaises(DurableExecutionError):
+            self.store.transition(request.task_id, "COMPLETED", result={"output": {"echo": "fabricated"}},
+                                  _engine_recorded=True)
+        with self.assertRaises(DurableExecutionError):
+            self.store.transition(request.task_id, "COMPLETED", result={"output": {"echo": "fabricated"}},
+                                  _engine_recorded=object())
+        with self.assertRaises(DurableExecutionError):
+            self.store.engine_completion_token({"output": {"echo": "other"}})
+        self.assertEqual(self.store.get_claim(request.task_id)["state"], "INVOKING")
+        self.assertEqual(self.adapter.calls, 0)
+
+    def test_manual_observation_is_a_note_not_proof(self) -> None:
+        request = self.request()
+        authorization = self.authorize(request)
+        self.store.claim(request, authorization)
+        self.store.transition(request.task_id, "AUTHORIZED")
+        self.store.transition(request.task_id, "INVOKING")
+        SQLiteExecutionStore(self.db_path).recover_inflight()
+        self.store.record_reconciliation_note(request.task_id, "I observed a synthetic output.")
+        claim = self.store.get_claim(request.task_id)
+        self.assertEqual(claim["state"], "RECONCILIATION_REQUIRED")
+        self.assertIsNone(claim["result_json"])
+        self.assertIn("observed", claim["reconciliation_notes_json"])
+        with self.assertRaises(DurableExecutionError):
+            self.store.transition(request.task_id, "COMPLETED", result={"echo": "synthetic"})
+        with self.assertRaises(DurableExecutionError):
+            self.store.transition(request.task_id, "COMPLETED", result={"echo": "synthetic"},
+                                  _engine_recorded=True)
         self.assertEqual(self.adapter.calls, 0)
 
     def test_duplicate_authorization_and_task_claim_reject_atomically(self) -> None:

@@ -800,6 +800,10 @@ class ExecutionEngine:
                     request.task_id,
                     durable_state,
                     result={"output": output} if state is ExecutionState.COMPLETED else None,
+                    _engine_recorded=(
+                        self.durable_store.engine_completion_token({"output": output})
+                        if state is ExecutionState.COMPLETED else None
+                    ),
                     error_category=category.value if category else None,
                     error_message=error_message,
                 )
