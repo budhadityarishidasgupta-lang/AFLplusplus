@@ -177,16 +177,25 @@ class AgentDiscovery:
         self._sources: dict[str, AgentSource] = {}
 
     def register_synthetic_source(self, agent_id: str, source: AgentSource) -> None:
-        """Attach explicit provenance for a test-scoped synthetic registration."""
+        """Attach provenance for an isolated acceptance or owner fixture."""
         trusted = getattr(self, "_trusted_acceptance_context", None)
-        if not callable(trusted):
-            raise ValidationError("synthetic source registration requires trusted test injection")
+        owner = getattr(self, "_trusted_owner_simulation_context", None)
+        trusted_test = False
+        trusted_owner = False
         try:
             from brain_core.mission_execution import _TRUSTED_ACCEPTANCE_HARNESS
-            if trusted() is not _TRUSTED_ACCEPTANCE_HARNESS:
-                raise ValidationError("synthetic source registration requires trusted test injection")
-        except Exception as error:
-            raise ValidationError("synthetic source registration requires trusted test injection") from error
+            trusted_test = callable(trusted) and trusted() is _TRUSTED_ACCEPTANCE_HARNESS
+            if callable(owner):
+                from brain_core.owner_simulation import validate_owner_authority
+                trusted_owner = validate_owner_authority(owner(), "synthetic.brain-owner-simulation")
+        except Exception:
+            trusted_test = trusted_owner = False
+        if not trusted_test and not trusted_owner:
+            raise ValidationError("synthetic source registration requires trusted owner or test authority")
+        if trusted_owner and agent_id != "synthetic.brain-owner-simulation":
+            raise ValidationError("owner authority cannot register a different synthetic adapter")
+        if trusted_test and agent_id != "synthetic.brain-acceptance":
+            raise ValidationError("test authority cannot register an owner simulation adapter")
         try:
             registration = self.registry.discover(agent_id)
         except AgentNotFoundError as error:

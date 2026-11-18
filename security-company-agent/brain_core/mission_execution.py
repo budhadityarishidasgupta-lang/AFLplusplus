@@ -66,16 +66,27 @@ class SyntheticMissionAdapter:
         }
 
 
+class OwnerSimulationAdapter(SyntheticMissionAdapter):
+    """Owner-facing deterministic fixture adapter; has no external interfaces."""
+    agent_id = "synthetic.brain-owner-simulation"
+
+
 class MissionExecutionService:
     """One-shot service using explicitly injected existing orchestration APIs."""
     def __init__(self, *, registry: Any, issuer: Any, engine: Any,
                  verifier: Any | None = None, now: Any = None, evidence_factory: Any = None,
                  notes_persist: Callable[[Any, str, str], None] | None = None,
                  persist_state: Callable[[Any], bool] | None = None,
-                 _acceptance_context: Any = None):
-        if _acceptance_context is not _TRUSTED_ACCEPTANCE_HARNESS:
-            raise MissionExecutionError("Synthetic execution requires trusted acceptance-harness injection.")
-        from control_plane.agent_contracts import CapabilityRegistry
+                 _acceptance_context: Any = None, _owner_authority: Any = None):
+        from . import owner_simulation
+        trusted_harness = _acceptance_context is _TRUSTED_ACCEPTANCE_HARNESS
+        owner_simulation_authorized = owner_simulation.validate_owner_authority(
+            _owner_authority, "synthetic.brain-owner-simulation")
+        if not trusted_harness and not owner_simulation_authorized:
+            raise MissionExecutionError("Synthetic execution requires trusted acceptance-harness or owner-local authority.")
+        self.__owner_simulation_authority = _owner_authority if owner_simulation_authorized else None
+        self.__owner_simulation_context = owner_simulation_authorized
+        from control_plane.agent_contracts import AgentContract, CapabilityRegistry, CapabilityStatus
         from control_plane.execution_engine import ExecutionAuthorizationIssuer, ExecutionEngine
         if not isinstance(registry, CapabilityRegistry):
             raise MissionExecutionError("A verified synthetic CapabilityRegistry is required.")
@@ -85,10 +96,17 @@ class MissionExecutionService:
             raise MissionExecutionError("Registry, issuer, and execution engine must share the same authority.")
         if engine.durable_store is None or issuer._durable_store is not engine.durable_store:
             raise MissionExecutionError("A shared durable execution ledger is required.")
-        if (set(engine._adapters) != {SYNTHETIC_AGENT_ID}
-                or type(engine._adapters[SYNTHETIC_AGENT_ID]) is not SyntheticMissionAdapter):
-            raise MissionExecutionError("Execution engine must expose only the reviewed synthetic acceptance adapter.")
+        expected_adapter = ("synthetic.brain-owner-simulation"
+                            if owner_simulation_authorized else SYNTHETIC_AGENT_ID)
+        expected_type = OwnerSimulationAdapter if owner_simulation_authorized else SyntheticMissionAdapter
+        if (set(engine._adapters) != {expected_adapter}
+                or type(engine._adapters[expected_adapter]) is not expected_type
+                or tuple(engine._adapters[expected_adapter].permissions) != (SYNTHETIC_PERMISSION,)
+                or tuple(engine._adapters[expected_adapter].capabilities) != (SYNTHETIC_CAPABILITY,)):
+            raise MissionExecutionError("Execution engine must expose only its exact approved synthetic adapter.")
         self.__trusted_acceptance_context = _acceptance_context
+        self.__owner_simulation_authority = _owner_authority if owner_simulation_authorized else None
+        self.__owner_simulation_context = owner_simulation_authorized
         self.registry = registry
         self.issuer = issuer
         self.engine = engine
@@ -109,22 +127,31 @@ class MissionExecutionService:
                   durable_store: Any = None, store_path: str | Path | None = None,
                   persist_state: Callable[[Any], bool] | None = None,
                   registry: Any = None,
-                  _acceptance_context: Any = None) -> "MissionExecutionService":
-        if _acceptance_context is not _TRUSTED_ACCEPTANCE_HARNESS:
-            raise MissionExecutionError("Synthetic fixture registration is restricted to the trusted acceptance harness.")
+                  _acceptance_context: Any = None,
+                  _owner_authority: Any = None) -> "MissionExecutionService":
+        from . import owner_simulation
+        trusted_harness = _acceptance_context is _TRUSTED_ACCEPTANCE_HARNESS
+        owner_authorized = owner_simulation.validate_owner_authority(
+            _owner_authority, "synthetic.brain-owner-simulation")
+        if not trusted_harness and not owner_authorized:
+            raise MissionExecutionError("Synthetic fixture registration requires trusted harness or owner-local authority.")
         from . import mission_conversation
         mission_conversation._orchestration()
         from control_plane.agent_contracts import AgentContract, CapabilityRegistry, CapabilityStatus, AgentNotFoundError
         if not isinstance(registry, CapabilityRegistry):
-            raise MissionExecutionError("Trusted acceptance harness must inject CapabilityRegistry.")
+            raise MissionExecutionError("Owner simulation requires an explicit CapabilityRegistry.")
+        if owner_authorized and registry.list_agents():
+            raise MissionExecutionError("Owner simulation must use an isolated registry containing only its synthetic fixture.")
         from control_plane.execution_durability import SQLiteExecutionStore
         from control_plane.execution_engine import ExecutionAuthorizationIssuer, ExecutionEngine
+        adapter_id = "synthetic.brain-owner-simulation" if owner_authorized else SYNTHETIC_AGENT_ID
         try:
-            registration = registry.discover(SYNTHETIC_AGENT_ID)
+            registration = registry.discover(adapter_id)
         except AgentNotFoundError:
             registration = registry.register(AgentContract(
-                agent_id=SYNTHETIC_AGENT_ID,
-                purpose="Deterministic local fixture for Brain acceptance only.",
+                agent_id=adapter_id,
+                purpose=("Deterministic owner-supervised local simulation fixture." if owner_authorized
+                         else "Deterministic local fixture for Brain acceptance only."),
                 version="1.0.0", capabilities=(SYNTHETIC_CAPABILITY,),
                 supported_tasks=("synthetic-mission-report",),
                 inputs={"objective": "synthetic text", "success_criteria": "synthetic criteria"},
@@ -133,7 +160,10 @@ class MissionExecutionService:
             ), CapabilityStatus.VERIFIED)
         if (registration.status is not CapabilityStatus.VERIFIED
                 or len(registry.list_agents()) != 1
-                or registration.contract.agent_id != SYNTHETIC_AGENT_ID
+                or registration.contract.agent_id != adapter_id
+                or registration.contract.purpose != (
+                    "Deterministic owner-supervised local simulation fixture." if owner_authorized
+                    else "Deterministic local fixture for Brain acceptance only.")
                 or registration.contract.capabilities != (SYNTHETIC_CAPABILITY,)
                 or registration.contract.supported_tasks != ("synthetic-mission-report",)
                 or registration.contract.permissions != (SYNTHETIC_PERMISSION,)):
@@ -148,7 +178,6 @@ class MissionExecutionService:
             store_cache = {}
             durable_store._brain_execution_service_cache = store_cache
         if store_path is not None:
-            from pathlib import Path
             backend_cache = getattr(mission_conversation, "_acceptance_execution_stores", None)
             if not isinstance(backend_cache, dict):
                 backend_cache = {}
@@ -160,38 +189,62 @@ class MissionExecutionService:
         engine = ExecutionEngine(registry, issuer, limits=limits, durable_store=durable_store)
         issuer._trusted_acceptance_context = lambda: (
             _TRUSTED_ACCEPTANCE_HARNESS if _acceptance_context is _TRUSTED_ACCEPTANCE_HARNESS else None)
+        issuer._trusted_owner_simulation_context = lambda: owner_authorized and owner_simulation.validate_owner_authority(
+            _owner_authority, "synthetic.brain-owner-simulation") is True
         engine._trusted_acceptance_context = issuer._trusted_acceptance_context
-        engine.register_adapter(SyntheticMissionAdapter())
+        engine._trusted_owner_simulation_context = lambda: (
+            bool(issuer._trusted_owner_simulation_context())
+            if callable(issuer._trusted_owner_simulation_context) else False)
+        engine.register_adapter(OwnerSimulationAdapter() if owner_authorized else SyntheticMissionAdapter())
         from control_plane.result_verification import ResultVerifier
         service = cls(registry=registry, issuer=issuer, engine=engine,
                       verifier=ResultVerifier(), now=now, persist_state=persist_state,
-                      _acceptance_context=_acceptance_context)
+                      _acceptance_context=_acceptance_context,
+                      _owner_authority=_owner_authority)
         store_cache.update({"issuer": issuer, "engine": engine, "service": service})
         service._issued_authorizations = issued_authorizations
+        if owner_authorized:
+            object.__setattr__(_owner_authority, "_service", service)
         return service
 
-    def mission_capability_discovery(self, *, _acceptance_context: Any = None):
-        """Return a planning discovery over the trusted test service registry."""
-        if (_acceptance_context is not _TRUSTED_ACCEPTANCE_HARNESS
-                or getattr(self, "_MissionExecutionService__trusted_acceptance_context", None)
-                is not _TRUSTED_ACCEPTANCE_HARNESS
-                or not callable(getattr(self.engine, "_trusted_acceptance_context", None))
-                or self.engine._trusted_acceptance_context() is not _TRUSTED_ACCEPTANCE_HARNESS):
-            raise MissionExecutionError("Synthetic capability discovery is restricted to the trusted acceptance harness.")
+    def mission_capability_discovery(self, *, _acceptance_context: Any = None,
+                                     _owner_authority: Any = None):
+        """Return fixture discovery for exactly one trusted context."""
+        from . import owner_simulation
+        trusted_harness = (_acceptance_context is _TRUSTED_ACCEPTANCE_HARNESS
+                           and getattr(self, "_MissionExecutionService__trusted_acceptance_context", None)
+                           is _TRUSTED_ACCEPTANCE_HARNESS
+                           and callable(getattr(self.engine, "_trusted_acceptance_context", None))
+                           and self.engine._trusted_acceptance_context() is _TRUSTED_ACCEPTANCE_HARNESS)
+        owner_authorized = (owner_simulation.validate_owner_authority(
+                                _owner_authority, "synthetic.brain-owner-simulation")
+                            and getattr(self, "_MissionExecutionService__owner_simulation_context", False)
+                            and owner_simulation.validate_owner_authority(
+                                getattr(self, "_MissionExecutionService__owner_simulation_authority", None),
+                                "synthetic.brain-owner-simulation")
+                            and callable(getattr(self.engine, "_trusted_owner_simulation_context", None))
+                            and self.engine._trusted_owner_simulation_context())
+        if not trusted_harness and not owner_authorized:
+            raise MissionExecutionError("Synthetic capability discovery requires trusted harness or owner-local authority.")
+        context = _TRUSTED_ACCEPTANCE_HARNESS if trusted_harness else _owner_authority
         from control_plane.agent_discovery import AgentDiscovery, AgentSource
         discovery = AgentDiscovery(self.registry)
         discovery._trusted_acceptance_context = lambda: (
-            _TRUSTED_ACCEPTANCE_HARNESS if getattr(
-                self, "_MissionExecutionService__trusted_acceptance_context", None)
-                is _TRUSTED_ACCEPTANCE_HARNESS and callable(getattr(
-                self.engine, "_trusted_acceptance_context", None))
-                and self.engine._trusted_acceptance_context() is _TRUSTED_ACCEPTANCE_HARNESS else None)
+            _TRUSTED_ACCEPTANCE_HARNESS if trusted_harness else None)
+        if owner_authorized:
+            discovery._trusted_owner_simulation_context = lambda: (
+                context if owner_simulation.validate_owner_authority(
+                    context, "synthetic.brain-owner-simulation") else None)
+        if owner_authorized:
+            self.__owner_simulation_discovery = discovery
         discovery._acceptance_service = self
-        discovery.discover_existing()
-        discovery.register_synthetic_source(SYNTHETIC_AGENT_ID, AgentSource(
+        if not owner_authorized:
+            discovery.discover_existing()
+        agent_id = "synthetic.brain-owner-simulation" if owner_authorized else SYNTHETIC_AGENT_ID
+        discovery.register_synthetic_source(agent_id, AgentSource(
             module="synthetic_fixture", source_file="mission_execution.py",
             evidence=("invoke",),
-            limitations=("Test-scoped deterministic fixture only; no specialist access.",),
+            limitations=("Deterministic local synthetic fixture only; no research, external service, or specialist access.",),
             tool_requirements=(), internet_access="none",
             execution_integration_available=False))
         return discovery
@@ -202,29 +255,42 @@ class MissionExecutionService:
         from control_plane.result_verification import Evidence, TaskVerificationInput
         return ExecutionRequest, Evidence, TaskVerificationInput
 
-    @staticmethod
-    def _task(state: Any, task_id: str):
+    def _task(self, state: Any, task_id: str):
+        from . import owner_simulation
         task = next((item for item in state.plan.tasks if item.task_id == task_id), None)
         if task is None:
             raise MissionExecutionError("Task does not belong to this mission.")
         if not task.proposed_agent:
             raise MissionExecutionError("The current mission plan has no proposed task to bind for synthetic acceptance.")
-        if task.proposed_agent != SYNTHETIC_AGENT_ID:
-            raise MissionExecutionError("Original security and specialist agents are unavailable for execution.")
+        from . import owner_simulation
+        allowed_adapter = ("synthetic.brain-owner-simulation"
+                           if getattr(self, "_MissionExecutionService__owner_simulation_context", False)
+                           and owner_simulation.validate_owner_authority(
+                               getattr(self, "_MissionExecutionService__owner_simulation_authority", None),
+                               "synthetic.brain-owner-simulation") else SYNTHETIC_AGENT_ID)
+        if task.proposed_agent != allowed_adapter:
+            raise MissionExecutionError("Only the explicitly scoped deterministic synthetic adapter is available.")
         return task
 
     def _request(self, state: Any, task: Any):
+        from . import owner_simulation
         ExecutionRequest, _, _ = self._contracts()
         key = (state.mission.mission_id, task.task_id)
-        if task.proposed_agent != SYNTHETIC_AGENT_ID:
-            raise MissionExecutionError("Only the exact synthetic adapter can be authorized by this bridge.")
+        if task.proposed_agent not in {SYNTHETIC_AGENT_ID, "synthetic.brain-owner-simulation"}:
+            raise MissionExecutionError("Only registered deterministic synthetic adapters can be authorized by this bridge.")
+        if task.proposed_agent == "synthetic.brain-owner-simulation" and not (
+                getattr(self, "_MissionExecutionService__owner_simulation_context", False)
+                and owner_simulation.validate_owner_authority(
+                    getattr(self, "_MissionExecutionService__owner_simulation_authority", None),
+                    "synthetic.brain-owner-simulation")):
+            raise MissionExecutionError("Owner simulation authority is absent or revoked.")
         if tuple(task.required_permissions) != (SYNTHETIC_PERMISSION,):
             raise MissionExecutionError("The planned permission scope differs from the synthetic adapter contract.")
         if tuple(task.required_capabilities) != (SYNTHETIC_CAPABILITY,):
             raise MissionExecutionError("The planned capability differs from the synthetic adapter contract.")
         request = ExecutionRequest(
             task_id=task.task_id, mission_id=state.mission.mission_id,
-            agent_id=SYNTHETIC_AGENT_ID, capability=SYNTHETIC_CAPABILITY,
+            agent_id=task.proposed_agent, capability=SYNTHETIC_CAPABILITY,
             input_data={"objective": state.mission.original_objective,
                         "success_criteria": list(state.mission.success_criteria)},
             permissions=(SYNTHETIC_PERMISSION,), depth=0, timeout_seconds=5.0)
@@ -235,6 +301,7 @@ class MissionExecutionService:
         return request
 
     def authorize(self, state: Any, task_id: str, approval: ExecutionApproval, *, persist_claim: Any = None):
+        from . import owner_simulation
         from control_plane.execution_engine import ExecutionAuthorization, ExecutionAuthorizationIssuer
         with self._lock:
             task = self._task(state, task_id)
@@ -265,8 +332,12 @@ class MissionExecutionService:
                     raise MissionExecutionError("The authorization issuer is not bound to the execution ledger.")
             except ImportError as error:
                 raise MissionExecutionError("Reviewed execution authorization contracts are unavailable.") from error
+            expected_adapter = ("synthetic.brain-owner-simulation"
+                                if self.__owner_simulation_context and owner_simulation.validate_owner_authority(
+                                    self.__owner_simulation_authority, "synthetic.brain-owner-simulation")
+                                else SYNTHETIC_AGENT_ID)
             if (approval.mission_id != state.mission.mission_id or approval.task_id != task_id
-                    or approval.adapter_id != SYNTHETIC_AGENT_ID
+                    or approval.adapter_id != expected_adapter
                     or approval.scope != (SYNTHETIC_PERMISSION,)
                     or not isinstance(approval.approved_by, str) or not approval.approved_by.strip()
                     or not isinstance(approval.reason, str) or not approval.reason.strip()):

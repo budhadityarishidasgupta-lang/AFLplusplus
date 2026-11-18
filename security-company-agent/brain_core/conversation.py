@@ -28,10 +28,13 @@ def classify_intent(text: str) -> Route:
     body = (text or '').strip()
     folded = body.casefold()
     negated_training = _has_negated_training_intent(folded)
+    if re.search(r'\brefresh (?:the )?execution status\b', folded):
+        return Route('emotional_reasoning', 'default', 'Ordinary chat message; execution-status wording is not an execution command.')
     mission_status_request = re.search(
         r'\b(?:what is your plan|show (?:me )?(?:the )?plan|what tasks require approval|'
         r'which tasks require approval|what have (?:your|the) agents completed|'
-        r'what remains unfinished|what is unfinished|which agent can help me accomplish this)\b', folded)
+        r'what remains unfinished|what is unfinished|which agent can help me accomplish this|'
+        r'refresh (?:the )?execution status|execution status)\b', folded)
     if mission_status_request:
         return Route('mission_status', 'explicit', 'Read-only request for the current mission plan or status.')
 
@@ -340,8 +343,17 @@ def persist_planning_approval(conversation_id, state, request_key, *, data_dir=N
         state_synthetic = (state.get('synthetic_acceptance') is True
                            or state.get('plan', {}).get('synthetic_acceptance') is True)
         trusted_context = state.get('_trusted_acceptance_harness') is True
+        trusted_owner = state.get('_trusted_owner_simulation') is True
+        owner_context_valid = False
+        if trusted_owner:
+            from . import owner_simulation
+            context = owner_simulation._AUTHORITY
+            owner_context_valid = owner_simulation.validate_owner_authority(
+                context, 'synthetic.brain-owner-simulation')
         if ((current.get('synthetic_acceptance') is True or current.get('plan', {}).get('synthetic_acceptance') is True)
-                and state_synthetic and trusted_context):
+                and state_synthetic and (trusted_context or owner_context_valid)):
+            if owner_context_valid:
+                state['_owner_authority_context'] = owner_simulation._AUTHORITY
             state_tasks = state.get('plan', {}).get('tasks') or state.get('plan', {}).get('ordered_tasks', [])
             state_ids = {task.get('task_id') for task in state_tasks if isinstance(task, dict)}
             if state_ids and all(str(item).rsplit('.', 1)[-1] in
@@ -349,11 +361,13 @@ def persist_planning_approval(conversation_id, state, request_key, *, data_dir=N
                 valid_ids = state_ids
         approvals = state['approvals']
         if state_synthetic:
-            if not trusted_context or not (current.get('synthetic_acceptance') is True
+            if not (trusted_context or owner_context_valid) or not (current.get('synthetic_acceptance') is True
                     or current.get('plan', {}).get('synthetic_acceptance') is True):
                 return False
             state['synthetic_acceptance'] = True
             state['plan']['synthetic_acceptance'] = True
+            if owner_context_valid:
+                state['_trusted_owner_simulation'] = True
         synthetic_compat = (state_synthetic
                             and bool(approvals)
                             and all(str(task_id).rsplit('.', 1)[-1] in
@@ -380,6 +394,8 @@ def persist_planning_approval(conversation_id, state, request_key, *, data_dir=N
             return False
         updated = dict(current)
         updated['approvals'] = {**old_approvals, **approvals}
+        if owner_context_valid:
+            updated['_trusted_owner_simulation'] = True
         if synthetic_compat:
             stored_tasks = current.get('plan', {}).get('tasks') or current.get('plan', {}).get('ordered_tasks', [])
             task_ids_by_suffix = {str(task.get('task_id', '')).rsplit('.', 1)[-1]: task.get('task_id')
@@ -423,6 +439,16 @@ def save_mission_state(conversation_id, state, request_key, *, data_dir=None, db
         if (current.get('execution_records') == state.get('execution_records')
                 and current.get('execution_intents', {}) == state.get('execution_intents', {})):
             if current.get('approvals', {}) != state.get('approvals', {}):
+                if current.get('synthetic_acceptance') is True or current.get('plan', {}).get('synthetic_acceptance') is True:
+                    owner = state.get('_trusted_owner_simulation') is True
+                    test = state.get('_trusted_acceptance_harness') is True
+                    if owner:
+                        from . import owner_simulation
+                        if not owner_simulation.validate_owner_authority(
+                                owner_simulation._AUTHORITY, 'synthetic.brain-owner-simulation'):
+                            return current, stored_key, False
+                    elif not test:
+                        return current, stored_key, False
                 updated = dict(current)
                 updated['approvals'] = state.get('approvals', {})
                 db.execute('UPDATE conversation_mission_state SET state_json=?,updated_at=? '
@@ -442,7 +468,8 @@ def save_mission_state(conversation_id, state, request_key, *, data_dir=None, db
                           if isinstance(task, dict)}
         synthetic_state_match = (current.get('synthetic_acceptance') is True
                                  and state.get('synthetic_acceptance') is True
-                                 and state.get('_trusted_acceptance_harness') is True
+                                 and (state.get('_trusted_acceptance_harness') is True
+                                      or state.get('_trusted_owner_simulation') is True)
                                  and {str(item).rsplit('.', 1)[-1] for item in state_task_ids}
                                  == {str(item).rsplit('.', 1)[-1] for item in valid_ids})
         if not isinstance(old_records, dict) or not isinstance(new_records, dict):
@@ -477,7 +504,8 @@ def save_mission_state(conversation_id, state, request_key, *, data_dir=None, db
                           if isinstance(task, dict)}
         synthetic_state_match = (current.get('synthetic_acceptance') is True
                                  and state.get('synthetic_acceptance') is True
-                                 and state.get('_trusted_acceptance_harness') is True
+                                 and (state.get('_trusted_acceptance_harness') is True
+                                      or state.get('_trusted_owner_simulation') is True)
                                  and {str(item).rsplit('.', 1)[-1] for item in state_task_ids}
                                  == {str(item).rsplit('.', 1)[-1] for item in valid_ids})
         if synthetic_state_match:

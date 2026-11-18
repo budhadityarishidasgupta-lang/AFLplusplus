@@ -39,6 +39,12 @@ class ConversationMissionRepository:
         self.data_dir = data_dir
         self.db_path = db_path
         self.synthetic_fixture_discovery = synthetic_fixture_discovery
+        from . import owner_simulation
+        owner_context = getattr(synthetic_fixture_discovery, "_trusted_owner_simulation_context", None)
+        self._owner_simulation_authority = (owner_context() if callable(owner_context)
+                                            and owner_simulation.validate_owner_authority(
+                                                owner_context(), "synthetic.brain-owner-simulation")
+                                            else None)
         if synthetic_fixture_discovery is not None:
             stores = getattr(mission_conversation, "_acceptance_execution_stores", None)
             if isinstance(stores, dict):
@@ -53,13 +59,29 @@ class ConversationMissionRepository:
 
     def persist(self, conversation_id, state, request_key):
         serialized = state.to_dict()
-        if (self.synthetic_fixture_discovery is not None
-                and getattr(self.synthetic_fixture_discovery, "_acceptance_service", None) is not None):
+        owner_callback = getattr(self.synthetic_fixture_discovery, "_trusted_owner_simulation_context", None)
+        if callable(owner_callback):
+            authority = owner_callback()
+            from . import owner_simulation
+            if owner_simulation.validate_owner_authority(authority, "synthetic.brain-owner-simulation"):
+                self._owner_simulation_authority = authority
+                state._owner_authority = authority
+                state._trusted_owner_simulation = True
+        if self._is_trusted_test_context():
             serialized["_trusted_acceptance_harness"] = True
+        if self._is_trusted_owner_context():
+            serialized["_trusted_owner_simulation"] = True
         if getattr(state, "synthetic_acceptance", False):
             serialized["synthetic_acceptance"] = True
+        if getattr(state, "synthetic_acceptance", False):
             serialized["plan"]["synthetic_acceptance"] = True
             serialized["plan"]["mission_ref"] = serialized["mission"]["mission_id"]
+            serialized["_trusted_acceptance_harness"] = self._is_trusted_test_context()
+            serialized["_trusted_owner_simulation"] = self._is_trusted_owner_context()
+            if self._is_trusted_owner_context():
+                owner_callback = getattr(self.synthetic_fixture_discovery, "_trusted_owner_simulation_context")
+                self._owner_simulation_authority = owner_callback()
+                state._owner_authority = self._owner_simulation_authority
         execution_statuses = {'authorization_issued', 'running', 'completed', 'failed', 'cancelled',
                               'timed_out', 'interrupted'}
         has_execution_state = any(record.get('status') in execution_statuses
@@ -70,12 +92,15 @@ class ConversationMissionRepository:
                 data_dir=self.data_dir, db_path=self.db_path)
             return result[1] == request_key and result[0] == serialized
         if has_execution_state:
-            if self.synthetic_fixture_discovery is None:
+            discovery = self.synthetic_fixture_discovery
+            if discovery is None or getattr(discovery, "_acceptance_service", None) is None:
                 return False
-            service = getattr(self.synthetic_fixture_discovery, "_acceptance_service", None)
-            if service is None:
+            test_context = self._is_trusted_test_context()
+            owner_trusted = self._is_trusted_owner_context()
+            if not test_context and not owner_trusted:
                 return False
-            serialized["_trusted_acceptance_harness"] = True
+            if test_context:
+                serialized["_trusted_acceptance_harness"] = True
             result = self.backend.save_mission_state(
                 conversation_id, serialized, request_key,
                 data_dir=self.data_dir, db_path=self.db_path)
@@ -85,8 +110,15 @@ class ConversationMissionRepository:
             return self.backend.save_mission_state(
                 conversation_id, serialized, request_key,
                 data_dir=self.data_dir, db_path=self.db_path)[1] == request_key
-        if (state.approvals and not has_execution_state):
+        if state.approvals and not has_execution_state:
             if getattr(state, "synthetic_acceptance", False):
+                if self._is_trusted_owner_context():
+                    state._trusted_owner_simulation = True
+                    state._owner_authority = self._owner_simulation_authority
+                if not self._trusted_synthetic_context():
+                    return False
+                serialized["_trusted_acceptance_harness"] = self._is_trusted_test_context()
+                serialized["_trusted_owner_simulation"] = self._is_trusted_owner_context()
                 return self.backend.persist_planning_approval(
                     conversation_id, serialized, request_key,
                     data_dir=self.data_dir, db_path=self.db_path)
@@ -98,6 +130,23 @@ class ConversationMissionRepository:
             conversation_id, serialized, request_key,
             data_dir=self.data_dir, db_path=self.db_path)
         return key == request_key and payload == serialized
+
+    def _is_trusted_test_context(self):
+        from .mission_execution import _TRUSTED_ACCEPTANCE_HARNESS
+        discovery = self.synthetic_fixture_discovery
+        return (discovery is not None
+                and callable(getattr(discovery, "_trusted_acceptance_context", None))
+                and discovery._trusted_acceptance_context() is _TRUSTED_ACCEPTANCE_HARNESS)
+
+    def _is_trusted_owner_context(self):
+        from . import owner_simulation
+        discovery = self.synthetic_fixture_discovery
+        context = getattr(discovery, "_trusted_owner_simulation_context", None)
+        return bool(callable(context) and owner_simulation.validate_owner_authority(
+            context(), "synthetic.brain-owner-simulation"))
+
+    def _trusted_synthetic_context(self):
+        return self._is_trusted_test_context() or self._is_trusted_owner_context()
 
     @staticmethod
     def _confirm_execution_persist(result, expected, request_key):
@@ -120,34 +169,75 @@ class ConversationMissionRepository:
         # Only explicit trusted constructor injection can supply fixture discovery;
         # session and persisted mission fields are not consulted for authority.
         discovery = self.synthetic_fixture_discovery
+        owner_trusted = self._is_trusted_owner_context()
         persisted_synthetic = (payload.get("synthetic_acceptance") is True
                               or payload.get("plan", {}).get("synthetic_acceptance") is True)
         if persisted_synthetic and discovery is None:
-            state = mission_conversation.state_from_dict(
-                {**payload, "plan": {key: value for key, value in payload.get("plan", {}).items()
-                                      if key != "synthetic_acceptance"},
-                 "synthetic_acceptance": False},
-                capability_discovery=None)
-            state.synthetic_acceptance = False
-            return state, key
+            # Keep persisted proposals readable without treating their marker as
+            # authority; strip synthetic claims before normal state validation.
+            payload = dict(payload)
+            payload["synthetic_acceptance"] = False
+            payload_plan = dict(payload.get("plan", {}))
+            payload_plan["synthetic_acceptance"] = False
+            payload["plan"] = payload_plan
+            discovery = None
         state = mission_conversation.state_from_dict(payload, capability_discovery=discovery)
-        state._trusted_acceptance_harness = discovery is not None
-        state.synthetic_acceptance = discovery is not None
+        test_trusted = self._is_trusted_test_context()
+        state._trusted_acceptance_harness = test_trusted
+        state._trusted_owner_simulation = owner_trusted
+        state._owner_authority = self._owner_simulation_authority if owner_trusted else None
+        state.synthetic_acceptance = discovery is not None and (owner_trusted or test_trusted)
         if state.synthetic_acceptance and (payload.get("synthetic_acceptance") is True or payload.get("plan", {}).get("synthetic_acceptance") is True):
             from dataclasses import replace
             state.plan = replace(state.plan, mission_id=state.mission.mission_id,
                 tasks=tuple(replace(task, task_id=payload_task_ids.get(
                     task.task_id.rsplit(".", 1)[-1], task.task_id)) for task in state.plan.tasks))
         state.execution_intents = payload.get("execution_intents", {})
+        if state.synthetic_acceptance:
+            canonical_by_suffix = {str(item).rsplit(".", 1)[-1]: item
+                                   for item in payload_task_ids.values()}
+            from . import mission_conversation as mc
+            from control_plane.delegation_authorization import (
+                ApprovalDecision, ApprovalRequest, ApprovalStatus, DelegationAuthorizer)
+            authorizer = DelegationAuthorizer(discovery)
+            restored = {}
+            for task_id, item in payload.get("approvals", {}).items():
+                canonical_id = canonical_by_suffix.get(str(task_id).rsplit(".", 1)[-1])
+                if canonical_id not in {task.task_id for task in state.plan.tasks}:
+                    continue
+                req = item.get("request", {})
+                request = ApprovalRequest(
+                    request_id=req["request_id"], mission_ref=req["mission_ref"],
+                    task_ref=req["task_ref"], proposed_agent=req["proposed_agent"],
+                    capability=req["capability"], requested_action=req["requested_action"],
+                    expected_outcome=req["expected_outcome"],
+                    requested_permissions=tuple(req["requested_permissions"]),
+                    authorized_scope=tuple(req["authorized_scope"]), risks=tuple(req["risks"]),
+                    created_at=mc.datetime.fromisoformat(req["created_at"]),
+                    expires_at=mc.datetime.fromisoformat(req["expires_at"]),
+                    request_digest=req["request_digest"])
+                decision_data = item.get("decision")
+                decision = (ApprovalDecision(
+                    request_id=decision_data["request_id"],
+                    request_digest=decision_data["request_digest"],
+                    mission_ref=decision_data["mission_ref"], task_ref=decision_data["task_ref"],
+                    status=ApprovalStatus(decision_data["status"]),
+                    human_identity=decision_data["human_identity"],
+                    decided_at=mc.datetime.fromisoformat(decision_data["decided_at"]),
+                    reason=decision_data["reason"]) if decision_data else None)
+                restored[canonical_id] = (request, decision, authorizer)
+            state.approvals = restored
+            state._owner_simulation_context = owner_trusted
         state.execution_records = {task_id: dict(record) for task_id, record in payload.get("execution_records", {}).items()}
         state.execution_intents = {task_id: dict(intent) for task_id, intent in payload.get("execution_intents", {}).items()}
         for task_id, intent in state.execution_intents.items():
             state.execution_records.setdefault(task_id, {"task_id": task_id}).update(intent)
-        # Persisted flags are presentation metadata, never capability authority.
-        state.synthetic_acceptance = discovery is not None
+        state.synthetic_acceptance = discovery is not None and (owner_trusted or test_trusted)
+        if owner_trusted:
+            state._owner_authority = self._owner_simulation_authority
         if state.execution_records and not state.synthetic_acceptance:
             raise mission_conversation.MissionConversationError(
-                "Synthetic execution records require trusted acceptance-harness injection.")
+                "Synthetic execution records require trusted authority injection.")
         if state.execution_records:
             store_cache = getattr(mission_conversation, "_acceptance_execution_stores", None)
             execution_store = store_cache.get(str(self._execution_path())) if isinstance(store_cache, dict) else None
@@ -174,7 +264,7 @@ class ConversationMissionRepository:
                     record = state.execution_records.setdefault(task_id, {"task_id": task_id})
                     record["status"] = "interrupted"
                     record["reason"] = "durable claim unavailable; fail closed and prohibit replay"
-        state.synthetic_acceptance = discovery is not None
+        state.synthetic_acceptance = discovery is not None and (owner_trusted or test_trusted)
         return state, key
 
     def _execution_path(self):
@@ -200,16 +290,30 @@ class ConversationMissionRepository:
             state.synthetic_acceptance = False
             serialized = state.to_dict()
         if synthetic_fixture_discovery is not None:
-            from .mission_execution import _TRUSTED_ACCEPTANCE_HARNESS
             service = getattr(synthetic_fixture_discovery, "_acceptance_service", None)
-            if (getattr(synthetic_fixture_discovery, "_trusted_acceptance_context", lambda: None)()
-                    is not _TRUSTED_ACCEPTANCE_HARNESS or service is None
-                    or getattr(service, "_MissionExecutionService__trusted_acceptance_context", None)
-                    is not _TRUSTED_ACCEPTANCE_HARNESS):
+            from .mission_execution import _TRUSTED_ACCEPTANCE_HARNESS
+            trusted_test = (callable(getattr(synthetic_fixture_discovery, "_trusted_acceptance_context", None))
+                            and synthetic_fixture_discovery._trusted_acceptance_context() is _TRUSTED_ACCEPTANCE_HARNESS
+                            and getattr(service, "_MissionExecutionService__trusted_acceptance_context", None)
+                            is _TRUSTED_ACCEPTANCE_HARNESS)
+            from . import owner_simulation
+            owner_callback = getattr(synthetic_fixture_discovery, "_trusted_owner_simulation_context", None)
+            owner_authority = owner_callback() if callable(owner_callback) else None
+            trusted_owner = (owner_simulation.validate_owner_authority(
+                owner_authority, "synthetic.brain-owner-simulation")
+                and getattr(service, "_MissionExecutionService__owner_simulation_context", False))
+            if not trusted_test and not trusted_owner:
                 raise mission_conversation.MissionConversationError(
-                    "Acceptance repository received invalid fixture discovery.")
-            state._trusted_acceptance_harness = True
-            serialized["_trusted_acceptance_harness"] = True
+                    "Mission repository received invalid simulation authority.")
+            if trusted_test:
+                state._trusted_acceptance_harness = True
+                serialized["_trusted_acceptance_harness"] = True
+            if trusted_owner:
+                context = getattr(synthetic_fixture_discovery, "_trusted_owner_simulation_context", None)
+                self._owner_simulation_authority = context() if callable(context) else None
+                state._trusted_owner_simulation = True
+                state._owner_authority = self._owner_simulation_authority
+                serialized["_trusted_owner_simulation"] = True
         if synthetic_fixture_discovery is not None:
             state.synthetic_acceptance = True
         if synthetic_fixture_discovery is not None and getattr(state, "synthetic_acceptance", False):
@@ -229,7 +333,11 @@ class ConversationMissionRepository:
         state = mission_conversation.state_from_dict(
             payload, capability_discovery=self.synthetic_fixture_discovery if getattr(
                 self.synthetic_fixture_discovery, "_acceptance_service", None) is not None else None)
-        state._trusted_acceptance_harness = self.synthetic_fixture_discovery is not None
+        state._trusted_acceptance_harness = self._is_trusted_test_context()
+        state._trusted_owner_simulation = self._is_trusted_owner_context()
+        state._owner_simulation_context = state._trusted_owner_simulation
+        if state._trusted_owner_simulation:
+            state._owner_authority = self._owner_simulation_authority
         if payload.get("synthetic_acceptance") is True or payload.get("plan", {}).get("synthetic_acceptance") is True:
             from dataclasses import replace
             stored_tasks = payload.get("plan", {}).get("tasks", [])
@@ -242,10 +350,8 @@ class ConversationMissionRepository:
         state.execution_intents = {task_id: dict(intent) for task_id, intent in payload.get("execution_intents", {}).items()}
         for task_id, intent in state.execution_intents.items():
             state.execution_records.setdefault(task_id, {"task_id": task_id}).update(intent)
-        state.synthetic_acceptance = (payload.get("synthetic_acceptance") is True
-                                       or payload.get("plan", {}).get("synthetic_acceptance") is True
-                                       or self.synthetic_fixture_discovery is not None)
-        state.synthetic_acceptance = getattr(self, "synthetic_fixture_discovery", None) is not None
+        state.synthetic_acceptance = bool(self.synthetic_fixture_discovery is not None and (
+            state._trusted_acceptance_harness or state._trusted_owner_simulation))
         if state.synthetic_acceptance:
             state.capability_discovery = self.synthetic_fixture_discovery
         return state, key, inserted

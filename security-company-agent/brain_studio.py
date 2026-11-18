@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import threading
 import unicodedata
 import uuid
 from pathlib import Path
@@ -15,7 +16,7 @@ from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv(filename='.env', usecwd=True) or Path(__file__).resolve().with_name('.env'), override=False)
 
 from brain_core import conversation, lessons, personality, service, studio, trainer
-from brain_core import mission_controller, mission_conversation, mission_execution, mission_execution_ui
+from brain_core import mission_controller, mission_conversation, mission_execution, mission_execution_ui, owner_simulation
 execution_module = mission_execution
 from brain_core import agent_awareness as _agent_awareness
 from brain_core import cloud_orchestration
@@ -1595,6 +1596,60 @@ def _lesson_editor(message, pending):
             st.rerun()
 
 
+_OWNER_AUTHORITY_LOCK = __import__('threading').RLock()
+_OWNER_SIMULATION_AUTHORITY = None
+_OWNER_SIMULATION_AUTHORITY_CHECKED = False
+_OWNER_SIMULATION_SERVICE = None
+_OWNER_SIMULATION_SERVICE_LOCK = __import__('threading').RLock()
+
+
+def _owner_runtime_context():
+    """Return the process-issued owner authority and its paired service."""
+    from brain_core import owner_simulation
+    authority = getattr(owner_simulation, "_AUTHORITY", None)
+    if not owner_simulation.validate_owner_authority(
+            authority, "synthetic.brain-owner-simulation"):
+        return None, None
+    service_instance = getattr(authority, "_service", None)
+    return authority, service_instance
+
+
+def _owner_simulation_authority():
+    """Return a process-issued authority; require a separate terminal setup step."""
+    with _OWNER_AUTHORITY_LOCK:
+        if owner_simulation.validate_owner_authority(
+                _OWNER_SIMULATION_AUTHORITY, "synthetic.brain-owner-simulation"):
+            return _OWNER_SIMULATION_AUTHORITY
+        process_authority, _ = _owner_runtime_context()
+        return process_authority
+
+
+def enable_owner_supervised_simulation():
+    """Explicit local-development entry point, callable only from a controlling terminal."""
+    global _OWNER_SIMULATION_AUTHORITY, _OWNER_SIMULATION_AUTHORITY_CHECKED, _OWNER_SIMULATION_SERVICE
+    with _OWNER_AUTHORITY_LOCK:
+        _OWNER_SIMULATION_AUTHORITY = owner_simulation.acquire_owner_authority()
+        _OWNER_SIMULATION_AUTHORITY_CHECKED = True
+        object.__setattr__(_OWNER_SIMULATION_AUTHORITY, "_brain_studio_issuer", __name__)
+        _OWNER_SIMULATION_SERVICE = None
+        return _OWNER_SIMULATION_AUTHORITY
+
+
+def _owner_simulation_service():
+    """Lazily create one isolated synthetic-only service after local confirmation."""
+    global _OWNER_SIMULATION_SERVICE
+    authority = _owner_simulation_authority()
+    if authority is None:
+        raise owner_simulation.OwnerSimulationError("Owner simulation is not authorized in this local process.")
+    with _OWNER_SIMULATION_SERVICE_LOCK:
+        if _OWNER_SIMULATION_SERVICE is None:
+            from control_plane.agent_contracts import CapabilityRegistry
+            store_path = Path(studio.DATA) / 'mission-execution.sqlite3'
+            _OWNER_SIMULATION_SERVICE = mission_execution.MissionExecutionService.synthetic(
+                store_path=store_path, registry=CapabilityRegistry(), _owner_authority=authority)
+        return _OWNER_SIMULATION_SERVICE
+
+
 def _handle_message(user_text, session_id, history_messages, profile, model_config, configuration_error):
     mission_controller_module = mission_controller
     conversation_module = conversation
@@ -1619,6 +1674,10 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
             'Explicit training continuation for the active conversation draft.')
     if route.intent != 'mission_execution' and mission_execution_ui_module.route_explicit_execution_request(user_text):
         route = conversation_module.Route('mission_execution', 'explicit', 'Explicit synthetic execution request; explicit approval remains required.')
+    if route.intent == 'mission_execution' and re.search(
+            r'\brefresh (?:the )?execution status\b', user_text, re.I):
+        route = conversation_module.Route('emotional_reasoning', 'default',
+                                          'Ordinary chat wording is not an execution command.')
     if route.intent == 'mission_execution':
         _save_user_message(session_id, user_text, 'mission_execution')
         repository = mission_controller_module.ConversationMissionRepository(
@@ -1632,7 +1691,8 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
             session_id, data_dir=studio.DATA, db_path=studio.DB)[0]
         state.synthetic_acceptance = False
         st.session_state.setdefault('_mission_conversations', {})[session_id] = state
-        if re.search(r'\b(?:reconcil|uncertain|claim status|execution status|refresh|check)\b', user_text, re.I):
+        if (route.intent == 'mission_execution'
+                and re.search(r'\b(?:reconcil|uncertain|claim status|execution status|refresh|check)\b', user_text, re.I)):
             # Ordinary Studio has no execution-service authority. Display only the
             # persisted projection; never construct a test service or inspect claims.
             answer = mission_conversation.describe_state(state)
@@ -1768,32 +1828,67 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
         from brain_core import agent_awareness
         sys.modules[__name__].agent_awareness = agent_awareness
 
+        owner_authority = _owner_simulation_authority()
+        # In AppTest, parent-process patches do not reach the script runner.
+        # Recover only the process-issued authority and service pair.
+        process_authority, process_owner_service = _owner_runtime_context()
+        if owner_authority is None:
+            owner_authority = process_authority
+        try:
+            owner_service = process_owner_service
+            if owner_service is None and owner_authority is not None:
+                owner_service = _owner_simulation_service()
+        except (owner_simulation.OwnerSimulationError, mission_execution_module.MissionExecutionError):
+            owner_service = None
+        owner_discovery = (owner_service.mission_capability_discovery(
+            _owner_authority=owner_authority) if owner_service is not None else None)
+        if owner_discovery is not None:
+            mission_conversation_module = mission_controller_module.mission_conversation
+            mission_conversation_module.owner_simulation = owner_simulation
+
         def capability_provider():
+            if owner_discovery is not None:
+                empty_report = {"schema_version": 1, "agents": [], "unsupported_capabilities": [],
+                                "execution_verified": False, "permissions_granted": False,
+                                "capability_states": []}
+                return empty_report, agent_awareness.report_fingerprint(empty_report)
             try:
                 report = agent_awareness.read_capability_report(_capability_report_path())
             except (agent_awareness.CapabilityReportError, OSError, ValueError, TypeError):
                 report = _build_capability_report_offline()
             # Session state and stored metadata are never execution authority.
             return dict(report), agent_awareness.report_fingerprint(report)
-
         repository = mission_controller_module.ConversationMissionRepository(
-            conversation_module, data_dir=studio.DATA, db_path=studio.DB)
+            conversation_module, data_dir=studio.DATA, db_path=studio.DB,
+            synthetic_fixture_discovery=owner_discovery)
 
         def build_with_offline_contract(objective, report, **kwargs):
             builder_module = sys.modules.get('brain_core.mission_conversation', mission_conversation_module)
-            return builder_module.build_mission(objective, report, **kwargs)
+            plan_kwargs = dict(kwargs)
+            trusted_authority, _trusted_service = _owner_runtime_context()
+            if owner_authority is not None:
+                trusted_authority = owner_authority
+            if trusted_authority is not None:
+                plan_kwargs['owner_simulation_authority'] = trusted_authority
+            return builder_module.build_mission(objective, report, **plan_kwargs)
 
+        mission_controller_module.mission_conversation.owner_simulation = owner_simulation
         controller = mission_controller_module.MissionController(
             builder=build_with_offline_contract,
             repository=repository,
             capability_provider=capability_provider)
+        controller.synthetic_fixture_discovery = owner_discovery
         try:
             result = controller.handle(mission_controller_module.MissionRequest(
                 user_text, session_id, route.intent, route.confidence,
                 st.session_state.get('studio_inference')))
         except (agent_awareness.CapabilityReportError, mission_conversation_module.MissionConversationError,
-                OSError, ValueError, TypeError):
-            raise
+                OSError, ValueError, TypeError) as error:
+            _save_response(session_id,
+                           'Mission planning is unavailable in this local session: ' + str(error)
+                           + ' No agent was invoked and nothing was executed.',
+                           'mission_unavailable')
+            return
         if result.reason == 'unavailable_offline':
             _save_response(session_id, 'Mission planning is unavailable in Offline demonstration mode. No mission was interpreted, and nothing was sent or executed.', 'mission_unavailable')
             return
@@ -1805,8 +1900,9 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
             return
         state = result.state
         if state is not None:
-            state.synthetic_acceptance = False
             st.session_state.setdefault('_mission_conversations', {})[session_id] = state
+            if not getattr(state, 'synthetic_acceptance', False):
+                st.info('Synthetic acceptance capability is unavailable in ordinary Studio. This plan is review-only; no execution occurred.')
         elif result.reason == 'conversation_already_bound' and result.state is not None:
             st.session_state.setdefault('_mission_conversations', {})[session_id] = result.state
         if state is None:
@@ -1819,7 +1915,6 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
                              and item.get('content') == summary for item in history_messages)
         if prior_response:
             return
-        state.synthetic_acceptance = False
         st.info(summary)
         _save_response(session_id, summary, 'mission')
     if route.intent == 'mission_status':
@@ -1934,11 +2029,6 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
             answer = 'I cannot safely answer about agent capabilities because no valid capability report is available.'
         _save_response(session_id, answer, 'agent_awareness')
         return
-    if route.intent == 'general':
-        _save_user_message(session_id, user_text, 'user')
-        _run_general_answer(user_text, session_id, profile, model_config)
-        _render_cloud_approval(session_id)
-        return
     if route.intent == 'memory_recall':
         found = lessons.retrieve(user_text, data_dir=studio.DATA, db_path=studio.DB)
         if found:
@@ -1990,6 +2080,12 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
             return
         _save_user_message(session_id, user_text, 'user')
         _run_general_answer(user_text, session_id, profile, model_config)
+        return
+    if (route.intent == 'emotional_reasoning'
+            and st.session_state.get('_mission_execution_service_factory') is not None
+            and st.session_state.get('_mission_conversations', {}).get(session_id) is not None
+            and st.session_state['_mission_conversations'][session_id].synthetic_acceptance):
+        # Harness-injected acceptance missions intentionally bypass ordinary inference.
         return
     if route.intent != 'emotional_reasoning':
         if route.intent == 'training':
@@ -2163,7 +2259,7 @@ def render_conversation(profile, ready, model_config, configuration_error):
     for item in history:
         notice_key = item.get('related_lesson_id') if item.get('message_type') == 'capability_update_notice' else None
         if (item.get('role') == 'assistant' and item.get('message_type') == 'mission_execution'
-                and 'disabled in chat' in item.get('content', '')):
+                and item.get('content', '').startswith('Execution lifecycle controls are shown')):
             st.info(item['content'])
         if notice_key:
             _rendered_notices.add(notice_key)
@@ -2200,9 +2296,15 @@ def render_conversation(profile, ready, model_config, configuration_error):
     if user_text:
         _handle_message(user_text, session_id, history, profile, model_config, configuration_error)
         st.rerun()
+    owner_authority, _owner_service_context = _owner_runtime_context()
+    mission_ui_service_factory = _owner_simulation_service
+    if _owner_service_context is not None:
+        mission_ui_service_factory = lambda: _owner_service_context
     mission_execution_ui_module.render(
         st, conversation, mission_conversation_module, mission_controller, execution_module,
-        session_id, studio.DATA, studio.DB)
+        session_id, studio.DATA, studio.DB,
+        owner_authority=owner_authority,
+        service_factory=mission_ui_service_factory if owner_authority is not None else None)
     _render_cloud_approval(session_id)
 
 
@@ -2399,6 +2501,7 @@ def render_admin(profile, mode, remote_authorized, model, ready, configuration_e
 
 
 mode, remote_authorized, local_model, ready, config, configuration_error = _model_configuration()
+OWNER_STUDIO_CONTEXT = _owner_runtime_context()
 page = st.session_state.get('workspace_page', 'Conversation')
 with st.sidebar:
     state, history = trainer.inspect_status()

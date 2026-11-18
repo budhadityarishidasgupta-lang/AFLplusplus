@@ -337,6 +337,15 @@ class ExecutionAuthorizationIssuer:
                 raise
             except Exception as error:
                 raise ExecutionDenied("Brain acceptance fixture authorization is host-harness-only") from error
+        if request.agent_id == "synthetic.brain-owner-simulation":
+            trusted_owner = getattr(self, "_trusted_owner_simulation_context", None)
+            try:
+                if not callable(trusted_owner) or not trusted_owner():
+                    raise ExecutionDenied("Owner simulation authorization requires live local owner authority")
+            except ExecutionDenied:
+                raise
+            except Exception as error:
+                raise ExecutionDenied("Owner simulation authorization requires live local owner authority") from error
         digest = _digest(request.input_data)
         with self._lock:
             self._generation += 1
@@ -490,6 +499,14 @@ class ExecutionEngine:
                     raise ExecutionError("Brain acceptance adapter registration requires trusted test injection")
             except Exception as error:
                 raise ExecutionError("Brain acceptance adapter registration requires trusted test injection") from error
+        if getattr(adapter, "synthetic", None) is True and getattr(
+                adapter, "agent_id", None) == "synthetic.brain-owner-simulation":
+            trusted = getattr(self, "_trusted_owner_simulation_context", None)
+            try:
+                if not callable(trusted) or trusted() is not True:
+                    raise ExecutionError("Owner simulation adapter registration requires trusted local owner authority")
+            except Exception as error:
+                raise ExecutionError("Owner simulation adapter registration requires trusted local owner authority") from error
         if (
             not isinstance(adapter, ExecutionAdapter)
             or adapter.synthetic is not True
@@ -776,6 +793,13 @@ class ExecutionEngine:
             return self._results.get(task_id)
 
     def _validate_invocation(self, request: ExecutionRequest) -> ExecutionAdapter:
+        if request.agent_id == "synthetic.brain-owner-simulation":
+            trusted_owner = getattr(self, "_trusted_owner_simulation_context", None)
+            try:
+                if not callable(trusted_owner) or not trusted_owner():
+                    raise ExecutionError("Owner simulation execution requires live local owner authority")
+            except Exception as error:
+                raise ExecutionError("Owner simulation execution requires live local owner authority") from error
         if request.agent_id == "synthetic.brain-acceptance":
             trusted = getattr(self, "_trusted_acceptance_context", None)
             if not callable(trusted):

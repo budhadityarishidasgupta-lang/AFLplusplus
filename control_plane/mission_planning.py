@@ -291,14 +291,23 @@ class MissionPlanner:
         if not isinstance(self.discovery, AgentDiscovery):
             raise PlanningError("Synthetic planning requires the authoritative AgentDiscovery registry.")
         trusted = getattr(self.discovery, "_trusted_acceptance_context", None)
-        if not callable(trusted):
-            raise PlanningError("Synthetic planning capability requires trusted acceptance-harness discovery.")
+        owner = getattr(self.discovery, "_trusted_owner_simulation_context", None)
+        trusted_test = False
+        trusted_owner = False
         try:
             from brain_core.mission_execution import _TRUSTED_ACCEPTANCE_HARNESS
-            if trusted() is not _TRUSTED_ACCEPTANCE_HARNESS:
-                raise PlanningError("Synthetic planning capability requires trusted acceptance-harness discovery.")
-        except Exception as error:
-            raise PlanningError("Synthetic planning capability requires trusted acceptance-harness discovery.") from error
+            trusted_test = callable(trusted) and trusted() is _TRUSTED_ACCEPTANCE_HARNESS
+            if callable(owner):
+                from brain_core.owner_simulation import validate_owner_authority
+                trusted_owner = validate_owner_authority(owner(), "synthetic.brain-owner-simulation")
+        except Exception:
+            trusted_test = trusted_owner = False
+        if not trusted_test and not trusted_owner:
+            raise PlanningError("Synthetic planning capability requires trusted harness or owner authority.")
+        if trusted_owner and agent_id != "synthetic.brain-owner-simulation":
+            raise PlanningError("Owner authority cannot plan for a different synthetic adapter.")
+        if trusted_test and agent_id != "synthetic.brain-acceptance":
+            raise PlanningError("Test authority cannot plan for owner simulation.")
         if not all(isinstance(value, str) and value.strip() for value in
                    (agent_id, capability, task_type, permission, expected_deliverable)):
             raise PlanningError("synthetic planning metadata must be non-empty strings")
@@ -314,14 +323,41 @@ class MissionPlanner:
             raise PlanningError("synthetic planning metadata does not match its verified registry contract")
         self._synthetic_tasks[capability] = (task_type, (expected_deliverable,))
         self._synthetic_agents.add(agent_id)
+        self.available_permissions = frozenset((permission,))
+        self.selector = AgentSelector(self.discovery, self.verifier, (permission,))
+        self.discovery.register_synthetic_source(
+            agent_id,
+            __import__("control_plane.agent_discovery", fromlist=["AgentSource"]).AgentSource(
+                module="synthetic_fixture", source_file="mission_execution.py",
+                evidence=("invoke",), limitations=("Deterministic synthetic fixture only.",),
+                tool_requirements=(), internet_access="none", execution_integration_available=False))
         self.synthetic_permission = permission
+        self.selector = AgentSelector(self.discovery, self.verifier, (permission,))
 
     def plan(self, mission: Any) -> MissionPlan:
         reference = mission_reference_from_definition(mission)
-        self.discovery.discover_existing()
+        if self._synthetic_tasks:
+            trusted_owner = getattr(self.discovery, "_trusted_owner_simulation_context", None)
+            owner_active = False
+            if callable(trusted_owner):
+                from brain_core.owner_simulation import validate_owner_authority
+                owner_active = validate_owner_authority(
+                    trusted_owner(), "synthetic.brain-owner-simulation")
+            if owner_active and any(item.contract.agent_id not in self._synthetic_agents
+                                    for item in self.discovery.registry.list_agents()):
+                raise PlanningError("Synthetic-only planning registry contains an unapproved agent.")
+        else:
+            self.discovery.discover_existing()
         capabilities = reference.required_capabilities
         if self._synthetic_tasks:
             capabilities = (next(iter(self._synthetic_tasks)),)
+            reference = MissionReference(
+                mission_id=reference.mission_id, objective=reference.objective,
+                intended_outcome=reference.intended_outcome,
+                success_criteria=reference.success_criteria,
+                required_capabilities=(next(iter(self._synthetic_tasks)),),
+                constraints=(), dependencies=(),
+                authorization_requirements=reference.authorization_requirements)
         elif not capabilities:
             capabilities = ("mission-planning",)
         tasks: list[MissionTask] = []
@@ -334,7 +370,7 @@ class MissionPlanner:
         if self._synthetic_tasks:
             approval_requirements.add("explicit_approval")
         for index, capability in enumerate(capabilities, start=1):
-            match = self._synthetic_tasks.get(capability) or self._task_for_capability(capability)
+            match = self._synthetic_tasks.get(capability)
             if match is None:
                 task_type = "unsupported-task"
                 expected = ("Capability support assessment",)
@@ -425,6 +461,7 @@ class MissionPlanner:
             "attempt-budget-enforcement": ("enforce-attempt-budget", ("Budget enforcement result",)),
             "boundary-approval-gating": ("request-manual-approval", ("Approval gate status",)),
         }
+        mapping["synthetic-mission-report"] = ("synthetic-mission-report", ("Capability support assessment",))
         return mapping.get(capability)
 
 

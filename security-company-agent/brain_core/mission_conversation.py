@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
 
-from . import agent_awareness, mission_intelligence
+from . import agent_awareness, mission_intelligence, owner_simulation
 
 
 class MissionConversationError(ValueError):
@@ -86,15 +86,18 @@ def _orchestration():
     return tuple(modules)
 
 
-def _register_synthetic_planner(planner, discovery):
+def _register_synthetic_planner(planner, discovery, *, adapter_id=None):
     from . import mission_execution
     (_, _, _, _, mission_planning, _) = _orchestration()
+    adapter_id = adapter_id or mission_execution.SYNTHETIC_AGENT_ID
     planner.discovery = discovery
     planner.available_permissions = frozenset((mission_execution.SYNTHETIC_PERMISSION,))
     planner.selector = mission_planning.AgentSelector(discovery, planner.verifier,
                                                        (mission_execution.SYNTHETIC_PERMISSION,))
+    planner.available_permissions = frozenset((mission_execution.SYNTHETIC_PERMISSION,))
+    planner.discovery = discovery
     planner.register_synthetic_capability(
-        agent_id=mission_execution.SYNTHETIC_AGENT_ID,
+        agent_id=adapter_id,
         capability=mission_execution.SYNTHETIC_CAPABILITY,
         task_type="synthetic-mission-report", permission=mission_execution.SYNTHETIC_PERMISSION,
         expected_deliverable="Capability support assessment")
@@ -114,7 +117,7 @@ def _validate_fingerprint(capability_report, supplied):
 
 
 def build_mission(objective: str, capability_report: Mapping[str, Any], *, report_fingerprint: str,
-                  conversation_id: str):
+                  conversation_id: str, owner_simulation_authority: Any = None):
     if not isinstance(report_fingerprint, str) or len(report_fingerprint) != 64:
         raise MissionConversationError("A validated capability-report fingerprint is required.")
     if not isinstance(conversation_id, str) or not conversation_id.strip():
@@ -126,12 +129,20 @@ def build_mission(objective: str, capability_report: Mapping[str, Any], *, repor
     synthetic_marker = (isinstance(capability_report, Mapping) and
                         (capability_report.get("synthetic_acceptance") is True or
                          capability_report.get("_synthetic_acceptance") is True))
+    owner_simulation_enabled = owner_simulation.validate_owner_authority(
+        owner_simulation_authority, "synthetic.brain-owner-simulation")
     synthetic = False
     discovery = agent_discovery.AgentDiscovery(agent_contracts.CapabilityRegistry())
     if synthetic_marker:
+        if owner_simulation_enabled:
+            raise MissionConversationError("Owner simulation authority cannot be combined with test harness metadata.")
         discovery = capability_report.get("_fixture_discovery")
         if not isinstance(discovery, agent_discovery.AgentDiscovery):
             raise MissionConversationError("Synthetic acceptance requires explicit trusted discovery injection.")
+        owner_context = getattr(discovery, "_trusted_owner_simulation_context", None)
+        if callable(owner_context) and owner_simulation.validate_owner_authority(
+                owner_context(), "synthetic.brain-owner-simulation"):
+            raise MissionConversationError("Owner simulation authority cannot be combined with test harness metadata.")
         if not callable(getattr(discovery, "_trusted_acceptance_context", None)):
             raise MissionConversationError("Synthetic acceptance discovery is not trusted harness context.")
         try:
@@ -140,15 +151,61 @@ def build_mission(objective: str, capability_report: Mapping[str, Any], *, repor
         except Exception as error:
             raise MissionConversationError("Synthetic acceptance discovery is not trusted harness context.") from error
         synthetic = True
-    discovery.discover_existing()
+    elif owner_simulation_enabled:
+        service = getattr(owner_simulation_authority, "_service", None)
+        if service is None or not callable(getattr(service, "mission_capability_discovery", None)):
+            raise MissionConversationError("Owner simulation requires its live execution service.")
+        discovery = service.mission_capability_discovery(
+            _owner_authority=owner_simulation_authority)
+        if (not isinstance(discovery, agent_discovery.AgentDiscovery)
+                or not callable(getattr(discovery, "_trusted_owner_simulation_context", None))
+                or discovery._trusted_owner_simulation_context() is not owner_simulation_authority):
+            raise MissionConversationError("Owner simulation requires discovery from its authorized execution service.")
+        synthetic = True
+    if owner_simulation_enabled:
+        # Owner simulation uses a dedicated registry populated only by its synthetic adapter.
+        for registration in discovery.registry.list_agents():
+            if registration.contract.agent_id != "synthetic.brain-owner-simulation":
+                discovery.registry.unregister(registration.contract.agent_id)
+    elif synthetic_marker:
+        discovery.discover_existing()
     _validate_fingerprint(capability_report, report_fingerprint)
     if synthetic:
         from . import mission_execution
         definition = mission_intelligence.define_mission(objective, capability_report=None)
         plan_input = definition.to_dict()
-        plan_input["required_capabilities"] = [mission_execution.SYNTHETIC_CAPABILITY]
+        if synthetic_marker:
+            plan_input["required_capabilities"] = [mission_execution.SYNTHETIC_CAPABILITY]
+            plan_input["constraints"] = []
+            plan_input["dependencies"] = []
+            plan_input["authorization_requirements"] = ["explicit_approval"]
+            plan_input["missing_information"] = []
+            plan_input["provenance"] = {}
+            plan_input["mission_id"] = definition.mission_id
+            plan_input["original_objective"] = definition.original_objective
+            plan_input["intended_outcome"] = definition.intended_outcome
+            plan_input["success_criteria"] = list(definition.success_criteria)
+            plan_input["schema_version"] = 1
+            plan_input["status"] = "ready_for_review"
+            plan_input["execution_readiness"] = "not_assessed"
+            plan_input["risk_level"] = definition.risk_level
+            definition = mission_intelligence.validate_mission(plan_input)
+            plan_input = definition.to_dict()
+            plan_input["required_capabilities"] = [mission_execution.SYNTHETIC_CAPABILITY]
+            plan_input["constraints"] = []
+            plan_input["dependencies"] = []
+            plan_input["authorization_requirements"] = ["explicit_approval"]
+            plan_input["missing_information"] = []
+            plan_input["provenance"] = {}
+        elif owner_simulation_enabled:
+            # Keep planning conservative while explicitly binding the trusted fixture.
+            plan_input["required_capabilities"] = [mission_execution.SYNTHETIC_CAPABILITY]
+            plan_input["authorization_requirements"] = ["explicit_approval"]
         planner = mission_planning.MissionPlanner(discovery, (mission_execution.SYNTHETIC_PERMISSION,))
-        _register_synthetic_planner(planner, discovery)
+        _register_synthetic_planner(
+            planner, discovery,
+            adapter_id=("synthetic.brain-owner-simulation" if owner_simulation_enabled
+                        else mission_execution.SYNTHETIC_AGENT_ID))
     else:
         report = agent_awareness.read_capability_report(capability_report)
         declared = {cap["name"] for agent in report["agents"] for cap in agent["capabilities"]}
@@ -180,7 +237,15 @@ def build_mission(objective: str, capability_report: Mapping[str, Any], *, repor
         planner = mission_planning.MissionPlanner(discovery, ())
     if not synthetic:
         discovery.discover_existing()
+    if synthetic and owner_simulation_enabled:
+        plan_input["required_capabilities"] = [mission_execution.SYNTHETIC_CAPABILITY]
+        plan_input["authorization_requirements"] = ["explicit_approval"]
     plan = planner.plan(plan_input)
+    if synthetic and owner_simulation_enabled:
+        owner_task = next((task for task in plan.tasks
+                           if task.proposed_agent == "synthetic.brain-owner-simulation"), None)
+        if owner_task is None:
+            raise MissionConversationError("Owner-only planner did not bind the registered synthetic adapter.")
     if not synthetic and plan.tasks:
         from dataclasses import replace
         candidates = {item.capability: item for item in plan.candidates}
@@ -218,29 +283,47 @@ def state_from_dict(payload: Mapping[str, Any], *, capability_discovery=None):
     discovery = agent_discovery.AgentDiscovery(agent_contracts.CapabilityRegistry())
     if synthetic:
         if not isinstance(capability_discovery, agent_discovery.AgentDiscovery):
-            raise MissionConversationError("Synthetic reload requires trusted acceptance-harness discovery.")
+            raise MissionConversationError("Synthetic reload requires an explicitly trusted authority context.")
         service = getattr(capability_discovery, "_acceptance_service", None)
-        if (service is None or not callable(getattr(service, "mission_capability_discovery", None))
-                or getattr(service, "_MissionExecutionService__trusted_acceptance_context", None)
-                is not _trusted_acceptance_token()):
-            raise MissionConversationError("Synthetic reload requires trusted acceptance-harness discovery.")
+        if service is None or not callable(getattr(service, "mission_capability_discovery", None)):
+            raise MissionConversationError("Synthetic reload requires its live execution service.")
         trusted = getattr(capability_discovery, "_trusted_acceptance_context", None)
-        if not callable(trusted):
-            raise MissionConversationError("Synthetic reload discovery is not trusted harness context.")
+        owner_trusted = getattr(capability_discovery, "_trusted_owner_simulation_context", None)
+        accepted = False
         try:
-            if trusted() is not _trusted_acceptance_token():
-                raise MissionConversationError("Synthetic reload discovery is not trusted harness context.")
-        except Exception as error:
-            raise MissionConversationError("Synthetic reload discovery is not trusted harness context.") from error
+            accepted = (callable(trusted) and trusted() is _trusted_acceptance_token()) or (
+                callable(owner_trusted) and owner_simulation.validate_owner_authority(
+                    owner_trusted(), "synthetic.brain-owner-simulation"))
+        except Exception:
+            accepted = False
+        if not accepted:
+            raise MissionConversationError("Synthetic reload requires trusted harness or owner-local authority.")
         discovery = capability_discovery
+        owner_trusted = getattr(discovery, "_trusted_owner_simulation_context", None)
+        owner_enabled = callable(owner_trusted) and owner_simulation.validate_owner_authority(
+            owner_trusted(), "synthetic.brain-owner-simulation")
+        if owner_enabled:
+            for registration in discovery.registry.list_agents():
+                if registration.contract.agent_id != "synthetic.brain-owner-simulation":
+                    discovery.registry.unregister(registration.contract.agent_id)
+            discovery.discover_existing = lambda: None
     else:
+        owner_enabled = False
         discovery.discover_existing()
     plan_input = definition.to_dict()
     if synthetic:
         from . import mission_execution
         plan_input["required_capabilities"] = [mission_execution.SYNTHETIC_CAPABILITY]
+        plan_input["authorization_requirements"] = ["explicit_approval"]
+        plan_input["constraints"] = []
+        plan_input["dependencies"] = []
+        plan_input["missing_information"] = []
+        plan_input["provenance"] = {}
         planner = mission_planning.MissionPlanner(discovery, (mission_execution.SYNTHETIC_PERMISSION,))
-        _register_synthetic_planner(planner, discovery)
+        _register_synthetic_planner(
+            planner, discovery,
+            adapter_id=("synthetic.brain-owner-simulation" if owner_enabled
+                        else mission_execution.SYNTHETIC_AGENT_ID))
     else:
         aliases = {"mission-planning": "fuzzing-plan-generation", "information-research": "fuzzing-plan-generation",
                    "comparative-analysis": "coverage-feedback-scoring",
@@ -250,6 +333,10 @@ def state_from_dict(payload: Mapping[str, Any], *, capability_discovery=None):
         planner = mission_planning.MissionPlanner(discovery, ())
     plan = planner.plan(plan_input)
     if synthetic:
+        from . import mission_execution
+        owner_trusted = getattr(discovery, "_trusted_owner_simulation_context", None)
+        owner_enabled = callable(owner_trusted) and owner_simulation.validate_owner_authority(
+            owner_trusted(), "synthetic.brain-owner-simulation")
         stored_tasks = raw_plan.get("tasks") or raw_plan.get("ordered_tasks", [])
         ids = {item.get("task_id", "").rsplit(".", 1)[-1]: item.get("task_id")
                for item in stored_tasks if isinstance(item, Mapping)}
@@ -270,7 +357,23 @@ def state_from_dict(payload: Mapping[str, Any], *, capability_discovery=None):
         raise MissionConversationError("Stored capability fingerprint is invalid.")
     state = MissionConversationState(definition, plan, {}, {}, fingerprint, discovery if synthetic else None)
     state.synthetic_acceptance = synthetic
+    state._owner_simulation_context = synthetic and owner_enabled
     valid_ids = {task.task_id for task in plan.tasks}
+    if synthetic:
+        if not isinstance(raw_plan, Mapping):
+            raise MissionConversationError("Stored synthetic plan is invalid.")
+        valid_suffixes = {str(item).rsplit(".", 1)[-1] for item in valid_ids}
+        if (not {str(item).rsplit(".", 1)[-1] for item in raw_approvals}.issubset(valid_suffixes)
+                or not {str(item).rsplit(".", 1)[-1] for item in raw_records}.issubset(valid_suffixes)
+                or not {str(item).rsplit(".", 1)[-1] for item in raw_intents}.issubset(valid_suffixes)):
+            raise MissionConversationError("Stored mission state contains task references outside the reconstructed plan.")
+        task_by_suffix = {str(item).rsplit(".", 1)[-1]: item for item in valid_ids}
+        raw_approvals = {task_by_suffix.get(str(item).rsplit(".", 1)[-1], item): value
+                         for item, value in raw_approvals.items()}
+        raw_records = {task_by_suffix.get(str(item).rsplit(".", 1)[-1], item): value
+                       for item, value in raw_records.items()}
+        raw_intents = {task_by_suffix.get(str(item).rsplit(".", 1)[-1], item): value
+                       for item, value in raw_intents.items()}
     if set(raw_approvals) - valid_ids or set(raw_records) - valid_ids or set(raw_intents) - valid_ids:
         raise MissionConversationError("Stored mission state contains task references outside the reconstructed plan.")
     allowed = {"planned", "blocked", "authorized", "authorization_issued", "running", "completed",
@@ -334,7 +437,10 @@ def create_approval_request(state: MissionConversationState, task_id: str, *, no
         risk_summary=(state.mission.risk_level,))
     authorizer = authorization.DelegationAuthorizer(discovery)
     decision = authorizer.evaluate(proposal, context, requested_task_type=task.task_type)
-    if decision.state is not authorization.DelegationDecisionState.REQUIRES_HUMAN_APPROVAL:
+    owner_approval = bool(getattr(state, "_owner_simulation_context", False)
+                          and decision.state is authorization.DelegationDecisionState.APPROVABLE)
+    if (decision.state is not authorization.DelegationDecisionState.REQUIRES_HUMAN_APPROVAL
+            and not owner_approval):
         raise MissionConversationError("Task is not approvable: " + "; ".join(decision.reasons + decision.missing_requirements))
     request = authorizer.create_approval_request(
         proposal, context, requested_agent=task.proposed_agent, requested_action=task.description,
