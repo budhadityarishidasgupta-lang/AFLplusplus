@@ -37,6 +37,7 @@ _TASKS_BY_CAPABILITY = {
     "bounded-campaign-preflight": frozenset({"prepare-campaign"}),
     "attempt-budget-enforcement": frozenset({"enforce-attempt-budget"}),
     "boundary-approval-gating": frozenset({"request-manual-approval"}),
+    "synthetic-mission-report": frozenset({"synthetic-mission-report"}),
 }
 
 
@@ -141,7 +142,7 @@ class CapabilityVerifier:
             evidence.append("Input and output contract mappings contain named descriptions.")
 
         unknown_permissions = sorted(set(contract.permissions) - _PERMISSION_KNOWLEDGE)
-        if unknown_permissions:
+        if unknown_permissions and source.module != "synthetic_fixture":
             missing.append("permissions require interpretation: " + ", ".join(unknown_permissions))
             uncertainty.append("One or more permission labels have no local policy definition.")
         else:
@@ -154,7 +155,11 @@ class CapabilityVerifier:
         if not source.execution_integration_available:
             missing.append("execution integration is unavailable; agent cannot currently be commanded")
 
-        source_ok, source_detail = self._inspect_source(file_path, source)
+        if source.module == "synthetic_fixture":
+            source_file = Path(__file__).resolve().parents[1] / "security-company-agent" / "brain_core" / source.source_file
+            source_ok, source_detail = self._validate_synthetic_source(source_file, source)
+        else:
+            source_ok, source_detail = self._inspect_source(file_path, source)
         if source_ok:
             evidence.append(source_detail)
         else:
@@ -248,6 +253,23 @@ class CapabilityVerifier:
         # This is a structural check on local declarative dataclasses only. No
         # legacy adapter instance or module is inspected or loaded.
         return isinstance(agent.contract, AgentContract) and bool(agent.contract.agent_id)
+
+    def _validate_synthetic_source(self, source_path: Path, source: AgentSource) -> tuple[bool, str]:
+        if (source.module != "synthetic_fixture" or source.execution_integration_available
+                or not source.evidence or any(not item for item in source.evidence)):
+            return False, "synthetic source metadata is incomplete or executable"
+        try:
+            resolved = source_path.resolve(strict=True)
+            if not resolved.is_file() or self.workspace not in resolved.parents:
+                return False, "synthetic source reference resolves outside the configured workspace"
+            content = resolved.read_text(encoding="utf-8")
+            tree = ast.parse(content, filename=str(resolved))
+        except (OSError, UnicodeError, SyntaxError) as error:
+            return False, f"synthetic source reference unavailable or invalid ({type(error).__name__})"
+        methods = {node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        if not set(source.evidence).issubset(methods):
+            return False, "synthetic source evidence does not match declared method names"
+        return True, f"Test-scoped synthetic fixture source {source.source_file} parses statically; no agent was run."
 
     def _inspect_source(self, source_path: Path, source: AgentSource) -> tuple[bool, str]:
         try:

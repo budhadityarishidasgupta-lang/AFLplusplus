@@ -176,6 +176,29 @@ class AgentDiscovery:
         self.registry = registry if registry is not None else CapabilityRegistry()
         self._sources: dict[str, AgentSource] = {}
 
+    def register_synthetic_source(self, agent_id: str, source: AgentSource) -> None:
+        """Attach explicit provenance for a test-scoped synthetic registration."""
+        trusted = getattr(self, "_trusted_acceptance_context", None)
+        if not callable(trusted):
+            raise ValidationError("synthetic source registration requires trusted test injection")
+        try:
+            from brain_core.mission_execution import _TRUSTED_ACCEPTANCE_HARNESS
+            if trusted() is not _TRUSTED_ACCEPTANCE_HARNESS:
+                raise ValidationError("synthetic source registration requires trusted test injection")
+        except Exception as error:
+            raise ValidationError("synthetic source registration requires trusted test injection") from error
+        try:
+            registration = self.registry.discover(agent_id)
+        except AgentNotFoundError as error:
+            raise ValidationError("synthetic source requires a registered fixture agent") from error
+        if not isinstance(source, AgentSource):
+            raise ValidationError("source must be an AgentSource")
+        if source.module != "synthetic_fixture" or source.execution_integration_available:
+            raise ValidationError("synthetic source metadata must remain non-executable")
+        if registration.status is not CapabilityStatus.VERIFIED:
+            raise ValidationError("synthetic capability must be explicitly verified")
+        self._sources[agent_id] = source
+
     def discover_existing(self) -> tuple[DiscoveredAgent, ...]:
         """Register only explicitly catalogued agent roles; no imports or execution."""
         discovered = []

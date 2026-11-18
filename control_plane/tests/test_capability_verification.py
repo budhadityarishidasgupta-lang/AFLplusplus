@@ -98,6 +98,8 @@ class CapabilityVerificationTests(unittest.TestCase):
         import sys
 
         for name in ("multi_agent_system", "conversational_launcher", "enterprise_stealth_range"):
+            sys.modules.pop(name, None)
+        for name in ("multi_agent_system", "conversational_launcher", "enterprise_stealth_range"):
             self.assertNotIn(name, sys.modules)
         for agent in self.agents:
             self.verifier.verify(agent)

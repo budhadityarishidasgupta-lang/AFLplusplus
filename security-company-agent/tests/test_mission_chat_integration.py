@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from contextlib import ExitStack
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,40 +56,63 @@ def test_streamlit_chat_path_calls_mission_controller(tmp_path):
         plan = planning_module.MissionPlanner(discovery=discovery, available_permissions=()).plan(planning_input)
         return mission_conversation.MissionConversationState(definition, plan, {}, {}, fingerprint)
 
-    with patch.object(studio, "DATA", tmp_path), \
-         patch.object(studio, "DB", database), \
-         patch("brain_studio._model_configuration", return_value=(None, False, None, None, False)), \
-         patch("brain_studio._capability_report_path", side_effect=OSError("offline")), \
-         patch("brain_studio._build_capability_report_offline", return_value=report), \
-         patch("brain_studio._observe_capability_update_for_chat"), \
-         patch("brain_studio._render_pending_capability_notice"), \
-         patch("brain_studio.conversation.load_lesson_state", return_value=None), \
-         patch("brain_studio.installed_models", return_value=[]), \
-         patch("brain_studio.available_memory_gib", return_value=1.0), \
-         patch("brain_studio._run_general_answer") as general, \
-         patch("brain_studio.trainer.infer") as infer, \
-         patch.object(mission_controller.MissionController, "__init__", offline_init), \
-         patch.object(mission_controller.MissionController, "handle", observed_handle), \
-         patch.object(app_module.conversation, "classify_intent",
-                      wraps=conversation.classify_intent) as classify, \
-         patch.dict("sys.modules", {"brain_studio": app_module,
-                                    "brain_core.mission_controller": mission_controller,
-                                    "brain_core.mission_conversation": mission_conversation}):
+    test_patches = [
+        patch.object(studio, "DATA", tmp_path),
+        patch.object(studio, "DB", database),
+        patch.object(app_module, "mission_controller", mission_controller, create=True),
+        patch.object(app_module, "mission_conversation", mission_conversation, create=True),
+        patch.object(app_module, "conversation", conversation),
+        patch("brain_studio.studio.DATA", tmp_path),
+        patch("brain_studio.studio.DB", database),
+        patch("brain_studio.studio.initialize_store", wraps=studio.initialize_store),
+        patch("brain_studio.conversation.load_mission_state", wraps=conversation.load_mission_state),
+        patch("brain_studio._model_configuration", return_value=(None, False, None, None, False)),
+        patch("brain_studio._capability_report_path", side_effect=OSError("offline")),
+        patch("brain_studio._build_capability_report_offline", return_value=report),
+        patch("brain_studio.mission_controller", mission_controller, create=True),
+        patch("brain_studio.mission_conversation", mission_conversation, create=True),
+        patch.object(mission_controller, "ConversationMissionRepository", wraps=mission_controller.ConversationMissionRepository),
+        patch.object(mission_controller.MissionController, "__init__", offline_init),
+        patch.object(mission_controller.MissionController, "handle", observed_handle),
+        patch("brain_studio._observe_capability_update_for_chat"),
+        patch("brain_studio._render_pending_capability_notice"),
+        patch("brain_studio.conversation.load_lesson_state", return_value=None),
+        patch("brain_studio.installed_models", return_value=[]),
+        patch("brain_studio.available_memory_gib", return_value=1.0),
+        patch("brain_studio._run_general_answer"),
+        patch("brain_studio.trainer.infer"),
+        patch.object(app_module.conversation, "classify_intent", wraps=conversation.classify_intent),
+        patch.dict("sys.modules", {"brain_studio": app_module,
+                                   "brain_core.mission_controller": mission_controller,
+                                   "brain_core.mission_conversation": mission_conversation,
+                                   "brain_core.conversation": conversation}),
+    ]
+    with ExitStack() as stack:
+        mocks = [stack.enter_context(item) for item in test_patches]
+        mission_controller_mock = mocks[2]
+        init_store = mocks[7]
+        repository_factory = mocks[14]
+        general, infer = mocks[22], mocks[23]
+        classify = mocks[24]
         app.run()
         assert not app.exception
         app.session_state["studio_inference"] = "Automatic (Local first)"
         app.chat_input[0].set_value("Plan a synthetic test.").run()
         assert not app.exception
-        assert app_module.conversation.classify_intent is conversation.classify_intent
         assert app_module.studio is studio
+        assert app_module.conversation is conversation
 
     assert len(build_calls) == 1
     assert build_calls == ["Plan a synthetic test."]
     classify.assert_called_once_with("Plan a synthetic test.")
+    assert init_store.call_args.kwargs == {"data_dir": tmp_path, "db_path": database}
     assert len(controller_calls) == 1
     request = controller_calls[0]
+    assert controller_calls[0].intent == 'mission'
     assert request.text == "Plan a synthetic test."
     assert request.conversation_id == app.session_state["conversation_id"]
+    assert controller_calls[0].inference_mode == "Automatic (Local first)"
+    assert app.session_state.get("chat_error") is None
     general.assert_not_called()
     infer.assert_not_called()
     persisted = conversation.load_mission_state(

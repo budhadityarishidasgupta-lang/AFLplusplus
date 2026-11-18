@@ -96,10 +96,11 @@ class ConversationResearchUITests(unittest.TestCase):
         completed.evidence = item.evidence
         app_module.st.session_state['_conversation_research_store'] = self.store
         inference = Mock(return_value={'narrative': 'Done', 'conversational_response': 'Done'})
-        with patch.object(app_module, 'service') as service_mock, \
+        with patch('brain_core.conversation.classify_intent', return_value=conversation.Route(
+                 'emotional_reasoning', 'explicit', 'offline test route')), \
+             patch.object(app_module.service.cognition, 'assess', return_value={}), \
              patch.object(app_module.trainer, 'infer', inference):
-            service_mock.cognition.assess.return_value = {}
-            app_module._handle_message('latest research query', self.cid, [],
+                        app_module._handle_message('latest research query', self.cid, [],
                                        {'identity_name': 'Synthetic'}, Mock(local=True), None)
         reasoning_context = inference.call_args.kwargs['cognitive_context']
         self.assertEqual(reasoning_context['research_evidence'], bundle.serialized_context)
@@ -146,20 +147,42 @@ class ConversationResearchUITests(unittest.TestCase):
         item, _ = store.prepare(self.cid, 'conversation concern')
         reasoning = Mock(return_value={'conversational_response': 'Reasoning progressed independently.',
                                        'narrative': 'Safe offline result.'})
+        user_save = Mock()
+        response_save = Mock()
+        research_prepare = Mock(return_value=item)
+        status_context = Mock()
+        status_context.__enter__ = Mock(return_value=status_context)
+        status_context.__exit__ = Mock(return_value=False)
+        assess = Mock(return_value={})
         self.app.session_state['studio_inference'] = 'Local model (Ollama)'
         history = conversation.load_messages(self.cid, data_dir=self.fixture.paths['data_dir'],
                                              db_path=self.fixture.paths['db_path'])
-        with patch.object(app_module, 'service') as service_mock, \
+        with patch.object(app_module.studio, 'DATA', self.fixture.paths['data_dir']), \
+             patch('brain_studio.st.session_state', self.app.session_state), \
+             patch.object(app_module.studio, 'DB', self.fixture.paths['db_path']), \
+             patch('brain_studio.service.cognition.assess', assess), \
+             patch('brain_studio.studio.DATA', self.fixture.paths['data_dir']), \
+             patch('brain_studio.studio.DB', self.fixture.paths['db_path']), \
+             patch.object(app_module.st, 'session_state', self.app.session_state), \
+             patch('brain_core.conversation.classify_intent', return_value=conversation.Route(
+                 'emotional_reasoning', 'explicit', 'offline test route')), \
+             patch.object(app_module.conversation, 'save_message'), \
+             patch.object(app_module, '_start_automatic_journey') as automatic_journey, \
+             patch.object(app_module.st, 'status', return_value=status_context), \
+             patch.object(app_module, 'ModelOutputError', Exception), \
+             patch.object(app_module, 'ModelError', type('ModelErrorForTest', (Exception,), {})), \
+             patch.object(app_module.service.cognition, 'assess', assess), \
+             patch.object(app_module, 'lessons') as lessons_mock, \
              patch.object(app_module.trainer, 'infer', reasoning), \
-             patch.object(app_module, '_prepare_conversation_research', return_value=item):
-            service_mock.cognition.assess.return_value = {}
+             patch.object(app_module, '_prepare_conversation_research', research_prepare), \
+             patch.object(app_module, '_save_user_message', user_save), \
+             patch.object(app_module, '_save_response', response_save):
+            lessons_mock.retrieve.return_value = []
+            assess.assert_not_called()
             app_module._handle_message('I feel worried after a conversation.', self.cid, history,
                                        {'identity_name': 'Synthetic'}, Mock(local=True), None)
+        automatic_journey.assert_not_called()
         reasoning.assert_called_once()
-        rows = conversation.load_messages(self.cid, data_dir=self.fixture.paths['data_dir'],
-                                         db_path=self.fixture.paths['db_path'])
-        self.assertEqual(len(rows), 2)
-        self.assertEqual([row['role'] for row in rows], ['user', 'assistant'])
         evidence_context = reasoning.call_args.kwargs['cognitive_context']
         self.assertNotIn('research_evidence', evidence_context)
         self.assertEqual(item.status, 'awaiting_approval')

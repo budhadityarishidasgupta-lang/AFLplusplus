@@ -56,10 +56,11 @@ def app_source(tmp_path: Path, capability_report: Path) -> str:
     production_functions = (source[observe:save_response]
                             + source[save_response:handler_end]
                             + render_source)
-    startup = f'''import json, os, re, uuid
+    startup = f'''import json, os, re, sys, uuid
 from pathlib import Path
 import streamlit as st
 from brain_core import conversation, lessons, studio, trainer, personality, service
+from brain_core import mission_controller, mission_conversation, mission_execution, mission_execution_ui
 from brain_core.appraisal import NEUTRAL
 from brain_core.model_api import ModelConfig, ModelError, ModelOutputError
 from brain_core.runtime_guard import available_memory_gib

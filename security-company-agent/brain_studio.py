@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import sys
 import unicodedata
 import uuid
 from pathlib import Path
@@ -14,6 +15,8 @@ from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv(filename='.env', usecwd=True) or Path(__file__).resolve().with_name('.env'), override=False)
 
 from brain_core import conversation, lessons, personality, service, studio, trainer
+from brain_core import mission_controller, mission_conversation, mission_execution, mission_execution_ui
+execution_module = mission_execution
 from brain_core import agent_awareness as _agent_awareness
 from brain_core import cloud_orchestration
 from brain_core.appraisal import NEUTRAL
@@ -1555,6 +1558,11 @@ def _save_response(session_id, text, message_type, status='not_applicable', *, l
                               data_dir=studio.DATA, db_path=studio.DB)
 
 
+def _save_user_message(session_id, text, message_type='user'):
+    conversation.save_message(session_id, 'user', text, message_type=message_type,
+                              data_dir=studio.DATA, db_path=studio.DB)
+
+
 def _lesson_editor(message, pending):
     record = pending['record']
     st.info("I've prepared a lesson from your instructions. Please review it before approving.")
@@ -1588,144 +1596,161 @@ def _lesson_editor(message, pending):
 
 
 def _handle_message(user_text, session_id, history_messages, profile, model_config, configuration_error):
-    route = conversation.classify_intent(user_text)
-    persisted_pending = conversation.load_lesson_state(session_id, data_dir=studio.DATA, db_path=studio.DB)
-    # Never let an incomplete draft capture a separate request. Only an explicit
-    # training signal (or a labeled field update) continues the workflow.
-    fields_in_message = conversation.extract_lesson_fields(user_text)
+    mission_controller_module = mission_controller
+    conversation_module = conversation
+    mission_conversation_module = mission_conversation
+    mission_execution_module = mission_execution
+    mission_execution_ui_module = mission_execution_ui
+    execution_module = mission_execution_module
+    from brain_core import service as service_module
+    from brain_core import trainer as trainer_module
+    from brain_core import lessons as lessons_module
+    route = conversation_module.classify_intent(user_text)
+    persisted_pending = conversation_module.load_lesson_state(
+        session_id, data_dir=studio.DATA, db_path=studio.DB)
+    fields_in_message = conversation_module.extract_lesson_fields(user_text)
+    # Continue an incomplete draft only when the user explicitly signals training;
+    # unrelated mission, status, recall, and chat requests retain their own routes.
     if (persisted_pending and persisted_pending.get('status') == 'incomplete'
             and route.intent == 'training' and not fields_in_message
             and re.search(r'\b(continue|resume|teach|training|lesson|draft)\b', user_text, re.I)):
-        route = conversation.Route('training_follow_up', 'contextual',
-                                   'Explicit training continuation for the active conversation draft.')
-    conversation.save_message(session_id, 'user', user_text, message_type=route.intent,
-                              data_dir=studio.DATA, db_path=studio.DB)
-    _observe_capability_update_for_chat()
-    _render_pending_capability_notice()
-    if route.intent == 'training_cancel':
-        if persisted_pending and persisted_pending.get('status') == 'incomplete':
-            _save_response(session_id, 'Understood. The incomplete training draft is canceled.', 'training_canceled')
-            conversation.save_lesson_state(session_id, None, data_dir=studio.DATA, db_path=studio.DB)
-            if st.session_state.get('pending_lesson', {}).get('conversation_id') == session_id:
-                st.session_state.pending_lesson = None
-        elif persisted_pending and persisted_pending.get('status') == 'proposed':
-            _save_response(session_id, 'A lesson proposal is awaiting review. Use Reject lesson to explicitly reject it.', 'lesson_status')
-        else:
-            _save_response(session_id, 'There is no pending training draft to cancel.', 'lesson_status')
+        route = conversation_module.Route(
+            'training_follow_up', 'contextual',
+            'Explicit training continuation for the active conversation draft.')
+    if route.intent != 'mission_execution' and mission_execution_ui_module.route_explicit_execution_request(user_text):
+        route = conversation_module.Route('mission_execution', 'explicit', 'Explicit synthetic execution request; explicit approval remains required.')
+    if route.intent == 'mission_execution':
+        _save_user_message(session_id, user_text, 'mission_execution')
+        repository = mission_controller_module.ConversationMissionRepository(
+            conversation_module, data_dir=studio.DATA, db_path=studio.DB)
+        loaded = repository.load(session_id)
+        if loaded is None:
+            _save_response(session_id, 'There is no persisted mission in this conversation. No task was executed.', 'mission_execution')
+            return
+        state, request_key = loaded
+        stored_payload = conversation.load_mission_state(
+            session_id, data_dir=studio.DATA, db_path=studio.DB)[0]
+        state.synthetic_acceptance = False
+        st.session_state.setdefault('_mission_conversations', {})[session_id] = state
+        if re.search(r'\b(?:reconcil|uncertain|claim status|execution status|refresh|check)\b', user_text, re.I):
+            # Ordinary Studio has no execution-service authority. Display only the
+            # persisted projection; never construct a test service or inspect claims.
+            answer = mission_conversation.describe_state(state)
+            _save_response(session_id, answer, 'mission_execution_status')
+            return
+        _save_response(session_id, 'Execution lifecycle controls are shown with the active mission below. This request alone did not execute any task.', 'mission_execution')
         return
-    if route.intent == 'training_resume':
-        pending = persisted_pending
-        if pending and pending.get('status') == 'incomplete':
-            st.session_state.pending_lesson = pending
-            missing = conversation.missing_lesson_fields(pending.get('fields', {}))
-            _save_response(session_id, 'Training draft resumed. Please provide these missing fields: ' +
-                           ', '.join(missing) + '.', 'lesson_clarification')
-        elif pending and pending.get('status') == 'proposed':
-            st.session_state.pending_lesson = pending
-            _save_response(session_id, 'Your lesson proposal is ready to review in this conversation.', 'lesson_status')
-        else:
-            _save_response(session_id, 'There is no pending training draft to resume. You can start one by saying you want to teach a lesson.', 'lesson_status')
-        return
-    if route.intent in ('training', 'training_follow_up', 'correction'):
+    # Preserve the supervised chat-learning lifecycle alongside mission routing.
+    # Each path records the user message once and keeps drafts conversation-scoped.
+    if route.intent in ('training_cancel', 'training_resume', 'training', 'training_follow_up', 'correction',
+                        'lesson_approval', 'lesson_rejection'):
         pending = st.session_state.get('pending_lesson')
         if not pending or pending.get('conversation_id') != session_id:
-            pending = conversation.load_lesson_state(session_id, data_dir=studio.DATA, db_path=studio.DB)
-        if pending and pending.get('status') == 'proposed' and route.intent in ('training', 'correction'):
-            # The same submitted text is already represented in this chat; keep one proposal only.
-            prior_submission = any(m['role'] == 'user' and m['content'] == user_text and
-                                   m['message_type'] in ('training', 'correction') for m in history_messages)
-            if prior_submission:
+            pending = persisted_pending
+        _save_user_message(session_id, user_text, route.intent)
+        if route.intent == 'training_cancel':
+            if pending and pending.get('status') == 'incomplete':
+                _save_response(session_id, 'Understood. The incomplete training draft is canceled.', 'training_canceled')
+                conversation_module.save_lesson_state(session_id, None, data_dir=studio.DATA, db_path=studio.DB)
+                st.session_state.pending_lesson = None
+            elif pending and pending.get('status') == 'proposed':
+                _save_response(session_id, 'A lesson proposal is awaiting review. Use Reject lesson to explicitly reject it.', 'lesson_status')
+            else:
+                _save_response(session_id, 'There is no pending training draft to cancel.', 'lesson_status')
+            return
+        if route.intent == 'training_resume':
+            if pending:
                 st.session_state.pending_lesson = pending
-                return
-        fields = conversation.extract_lesson_fields(user_text)
-        pending_followup_fields = None
-        if pending and pending.get('status') == 'incomplete' and route.intent in ('training', 'training_follow_up') and not fields:
-            merged = dict(pending.get('fields', {}))
-            if user_text.strip():
-                missing = conversation.missing_lesson_fields(merged)
-                if len(missing) == 1:
+                if pending.get('status') == 'incomplete':
+                    missing = conversation_module.missing_lesson_fields(pending.get('fields', {}))
+                    response, kind = ('Training draft resumed. Please provide these missing fields: '
+                                      + ', '.join(missing) + '.', 'lesson_clarification')
+                else:
+                    response, kind = ('Your lesson proposal is ready to review in this conversation.', 'lesson_status')
+            else:
+                response, kind = ('There is no pending training draft to resume. You can start one by saying you want to teach a lesson.', 'lesson_status')
+            _save_response(session_id, response, kind)
+            return
+        if route.intent in ('training', 'training_follow_up', 'correction'):
+            fields = fields_in_message
+            if pending and pending.get('status') == 'proposed' and route.intent in ('training', 'correction'):
+                if any(item.get('role') == 'user' and item.get('content') == user_text
+                       and item.get('message_type') in ('training', 'correction') for item in history_messages):
+                    st.session_state.pending_lesson = pending
+                    return
+            if pending and pending.get('status') == 'incomplete' and route.intent in ('training', 'training_follow_up') and not fields:
+                merged = dict(pending.get('fields', {}))
+                missing = conversation_module.missing_lesson_fields(merged)
+                if len(missing) == 1 and user_text.strip():
                     merged['corrective_principle'] = user_text.strip()
                 else:
+                    st.session_state.pending_lesson = pending
                     _save_response(session_id, 'Please provide only these missing fields: ' + ', '.join(missing) + '.', 'lesson_clarification')
                     return
-            pending_followup_fields = merged
-        if route.intent == 'training' and not fields and (not pending or pending.get('status') != 'incomplete'):
-            state = {'fields': {}, 'message_id': str(uuid.uuid4()),
-                     'conversation_id': session_id, 'status': 'incomplete'}
-            st.session_state.pending_lesson = state
-            conversation.save_lesson_state(session_id, state, data_dir=studio.DATA, db_path=studio.DB)
-            _save_response(session_id, 'Please provide the lesson fields you want to teach. I will not invent missing details.', 'lesson_clarification')
-            return
-        if pending and pending.get('status') == 'proposed' and route.intent in ('training', 'training_follow_up') and not fields:
-            _save_response(session_id, 'Your lesson proposal is still pending. Edit it below, or explicitly approve or reject it.', 'lesson_status')
-            return
-        if route.intent == 'correction' and pending:
-            merged = dict(pending.get('fields', {}))
-            if fields:
+            elif route.intent == 'correction' and pending:
+                merged = dict(pending.get('fields', {}))
                 merged.update(fields)
-            else:
-                merged['corrective_principle'] = user_text
-        elif pending_followup_fields is not None:
-            merged = pending_followup_fields
-        elif pending and pending.get('status') == 'incomplete' and route.intent in ('training', 'training_follow_up'):
-            merged = dict(pending.get('fields', {}))
-            merged.update(fields)
-            if not fields:
-                _save_response(session_id, 'Please provide only these missing fields: ' + ', '.join(
-                    conversation.missing_lesson_fields(merged)) + '.', 'lesson_clarification')
+                if not fields:
+                    merged['corrective_principle'] = user_text.strip()
+            elif pending and pending.get('status') == 'proposed' and route.intent in ('training', 'training_follow_up') and not fields:
+                st.session_state.pending_lesson = pending
+                _save_response(session_id, 'Your lesson proposal is still pending. Edit it below, or explicitly approve or reject it.', 'lesson_status')
                 return
-        else:
-            merged = fields
-        proposal, merged = conversation.prepare_lesson('', existing=merged)
-        if proposal:
-            previous = next((m for m in reversed(history_messages)
-                             if m['role'] == 'assistant' and m['message_type'] == 'validated_reasoning'), None)
-            if route.intent == 'correction' and previous:
-                proposal['source_provenance'] = 'trainer_correction:' + previous['message_id']
-            reuse = pending and pending.get('status') == 'proposed' and pending.get('conversation_id') == session_id
-            assistant_id = pending['message_id'] if reuse else str(uuid.uuid4())
-            if reuse:
-                proposal['lesson_id'] = pending['record']['lesson_id']
-                proposal['created_at'] = pending['record']['created_at']
-            current = {'record': proposal, 'fields': merged, 'message_id': assistant_id,
-                       'conversation_id': session_id, 'status': 'proposed'}
-            st.session_state.pending_lesson = current
-            conversation.save_lesson_state(session_id, current, data_dir=studio.DATA, db_path=studio.DB)
-            conversation.save_message(session_id, 'assistant',
-                                      "I've prepared a lesson from your instructions. Please review it before approving.",
-                                      message_id=assistant_id, message_type='lesson_proposal',
-                                      data_dir=studio.DATA, db_path=studio.DB)
-        else:
-            missing = conversation.missing_lesson_fields(merged)
-            previous_state = pending if pending and pending.get('status') == 'incomplete' else None
-            state = {'fields': merged,
-                     'message_id': previous_state.get('message_id') if previous_state else str(uuid.uuid4()),
-                     'conversation_id': session_id, 'status': 'incomplete'}
-            st.session_state.pending_lesson = state
-            conversation.save_lesson_state(session_id, state, data_dir=studio.DATA, db_path=studio.DB)
-            _save_response(session_id, 'Please provide only these missing fields: ' + ', '.join(missing) +
-                           '. You may use the field labels.', 'lesson_clarification')
-        return
-    if route.intent in ('lesson_approval', 'lesson_rejection'):
-        pending = st.session_state.get('pending_lesson')
-        if not pending or pending.get('conversation_id') != session_id:
-            pending = conversation.load_lesson_state(session_id, data_dir=studio.DATA, db_path=studio.DB)
-        if not pending or pending.get('status') != 'proposed':
-            _save_response(session_id, 'There is no complete lesson proposal to ' +
-                           ('approve.' if route.intent == 'lesson_approval' else 'reject.'), 'lesson_clarification')
-        elif route.intent == 'lesson_approval':
-            lesson_id = lessons.approve(pending['record'], data_dir=studio.DATA, db_path=studio.DB)
-            _save_response(session_id, 'Lesson approved and saved.', 'lesson_approved', lesson_id=lesson_id)
-            conversation.save_lesson_state(session_id, None, data_dir=studio.DATA, db_path=studio.DB)
-            if st.session_state.get('pending_lesson', {}).get('conversation_id') == session_id:
+            else:
+                merged = dict(pending.get('fields', {})) if pending and pending.get('status') == 'incomplete' else {}
+                merged.update(fields)
+            if route.intent == 'training' and not fields and not (pending and pending.get('status') == 'incomplete'):
+                draft = {'fields': {}, 'message_id': str(uuid.uuid4()),
+                         'conversation_id': session_id, 'status': 'incomplete'}
+                st.session_state.pending_lesson = draft
+                conversation_module.save_lesson_state(session_id, draft, data_dir=studio.DATA, db_path=studio.DB)
+                _save_response(session_id, 'Please provide the lesson fields you want to teach. I will not invent missing details.', 'lesson_clarification')
+                return
+            proposal, merged = conversation_module.prepare_lesson('', existing=merged)
+            if proposal:
+                previous = next((item for item in reversed(history_messages)
+                                 if item.get('role') == 'assistant'
+                                 and item.get('message_type') == 'validated_reasoning'), None)
+                if route.intent == 'correction' and previous:
+                    proposal['source_provenance'] = 'trainer_correction:' + previous['message_id']
+                reuse = pending and pending.get('status') == 'proposed'
+                message_id = pending['message_id'] if reuse else str(uuid.uuid4())
+                if reuse:
+                    proposal['lesson_id'] = pending['record']['lesson_id']
+                    proposal['created_at'] = pending['record']['created_at']
+                draft = {'record': proposal, 'fields': merged, 'message_id': message_id,
+                         'conversation_id': session_id, 'status': 'proposed'}
+                st.session_state.pending_lesson = draft
+                conversation_module.save_lesson_state(session_id, draft, data_dir=studio.DATA, db_path=studio.DB)
+                conversation_module.save_message(
+                    session_id, 'assistant', "I've prepared a lesson from your instructions. Please review it before approving.",
+                    message_id=message_id, message_type='lesson_proposal', data_dir=studio.DATA, db_path=studio.DB)
+            else:
+                missing = conversation_module.missing_lesson_fields(merged)
+                draft = {'fields': merged,
+                         'message_id': pending.get('message_id') if pending and pending.get('status') == 'incomplete' else str(uuid.uuid4()),
+                         'conversation_id': session_id, 'status': 'incomplete'}
+                st.session_state.pending_lesson = draft
+                conversation_module.save_lesson_state(session_id, draft, data_dir=studio.DATA, db_path=studio.DB)
+                _save_response(session_id, 'Please provide only these missing fields: ' + ', '.join(missing) + '. You may use the field labels.', 'lesson_clarification')
+            return
+        if route.intent in ('lesson_approval', 'lesson_rejection'):
+            if not pending or pending.get('status') != 'proposed':
+                _save_response(session_id, 'There is no complete lesson proposal to ' +
+                               ('approve.' if route.intent == 'lesson_approval' else 'reject.'), 'lesson_clarification')
+            elif route.intent == 'lesson_approval':
+                lesson_id = lessons_module.approve(pending['record'], data_dir=studio.DATA, db_path=studio.DB)
+                _save_response(session_id, 'Lesson approved and saved.', 'lesson_approved', lesson_id=lesson_id)
+                conversation_module.save_lesson_state(session_id, None, data_dir=studio.DATA, db_path=studio.DB)
                 st.session_state.pending_lesson = None
-        else:
-            _save_response(session_id, 'Proposal rejected and discarded; no approved lesson was saved.', 'lesson_rejected')
-            conversation.save_lesson_state(session_id, None, data_dir=studio.DATA, db_path=studio.DB)
-            if st.session_state.get('pending_lesson', {}).get('conversation_id') == session_id:
+            else:
+                _save_response(session_id, 'Proposal rejected and discarded; no approved lesson was saved.', 'lesson_rejected')
+                conversation_module.save_lesson_state(session_id, None, data_dir=studio.DATA, db_path=studio.DB)
                 st.session_state.pending_lesson = None
-        return
+            return
     if route.intent == 'mission' and route.confidence == 'explicit':
+        history_messages = conversation.load_messages(
+            session_id, data_dir=studio.DATA, db_path=studio.DB)[:-1]
         prior_user_mission = any(
             message.get('role') == 'user' and message.get('content') == user_text
             and message.get('message_type') == 'mission' for message in history_messages)
@@ -1734,99 +1759,79 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
             and any(previous.get('role') == 'user' and previous.get('content') == user_text
                     and previous.get('message_type') == 'mission' for previous in history_messages[:index])
             for index, message in enumerate(history_messages))
+        _save_user_message(session_id, user_text, 'mission')
         if prior_user_mission and prior_assistant_mission:
             return
         if st.session_state.get('studio_inference') == 'Offline demonstration':
             _save_response(session_id, 'Mission planning is unavailable in Offline demonstration mode. No mission was interpreted, and nothing was sent or executed.', 'mission_unavailable')
             return
-        from brain_core import agent_awareness, mission_controller, mission_conversation
-        import sys
+        from brain_core import agent_awareness
         sys.modules[__name__].agent_awareness = agent_awareness
-        sys.modules[__name__].mission_controller = mission_controller
-        sys.modules[__name__].mission_conversation = mission_conversation
 
         def capability_provider():
             try:
                 report = agent_awareness.read_capability_report(_capability_report_path())
             except (agent_awareness.CapabilityReportError, OSError, ValueError, TypeError):
                 report = _build_capability_report_offline()
-            return report, agent_awareness.report_fingerprint(report)
+            # Session state and stored metadata are never execution authority.
+            return dict(report), agent_awareness.report_fingerprint(report)
 
-        controller = mission_controller.MissionController(
-            builder=mission_conversation.build_mission,
-            repository=mission_controller.ConversationMissionRepository(conversation),
+        repository = mission_controller_module.ConversationMissionRepository(
+            conversation_module, data_dir=studio.DATA, db_path=studio.DB)
+
+        def build_with_offline_contract(objective, report, **kwargs):
+            builder_module = sys.modules.get('brain_core.mission_conversation', mission_conversation_module)
+            return builder_module.build_mission(objective, report, **kwargs)
+
+        controller = mission_controller_module.MissionController(
+            builder=build_with_offline_contract,
+            repository=repository,
             capability_provider=capability_provider)
         try:
-            result = controller.handle(mission_controller.MissionRequest(
+            result = controller.handle(mission_controller_module.MissionRequest(
                 user_text, session_id, route.intent, route.confidence,
                 st.session_state.get('studio_inference')))
-        except (agent_awareness.CapabilityReportError, mission_conversation.MissionConversationError,
+        except (agent_awareness.CapabilityReportError, mission_conversation_module.MissionConversationError,
                 OSError, ValueError, TypeError):
-            result = mission_controller.MissionControllerResult(False, reason='unavailable')
+            raise
         if result.reason == 'unavailable_offline':
             _save_response(session_id, 'Mission planning is unavailable in Offline demonstration mode. No mission was interpreted, and nothing was sent or executed.', 'mission_unavailable')
             return
         if result.reason == 'conversation_already_bound':
             _save_response(session_id, 'This conversation already has a mission bound to it. Start a new conversation to plan a different mission.', 'mission_status')
             return
-        state = result.state
-        if state is not None:
-            st.session_state.setdefault('_mission_conversations', {})[session_id] = state
-        if not result.handled or state is None:
+        if not result.handled:
             _save_response(session_id, 'I can answer that as a normal conversation. What outcome would you like help with?', 'general')
             return
+        state = result.state
+        if state is not None:
+            state.synthetic_acceptance = False
+            st.session_state.setdefault('_mission_conversations', {})[session_id] = state
+        elif result.reason == 'conversation_already_bound' and result.state is not None:
+            st.session_state.setdefault('_mission_conversations', {})[session_id] = result.state
+        if state is None:
+            _save_response(session_id, 'The mission could not be created safely. No agent was invoked and nothing was executed.', 'mission_unavailable')
+            return
+        request = mission_controller_module.MissionRequest(user_text, session_id, route.intent, route.confidence,
+                                                    st.session_state.get('studio_inference'))
         summary = result.summary or mission_conversation.describe_state(state)
         prior_response = any(item.get('role') == 'assistant' and item.get('message_type') == 'mission'
                              and item.get('content') == summary for item in history_messages)
         if prior_response:
             return
+        state.synthetic_acceptance = False
         st.info(summary)
         _save_response(session_id, summary, 'mission')
-        for task in state.plan.tasks:
-            with st.expander(f"Task approval: {task.task_id}", expanded=False):
-                st.write(task.description)
-                st.write(f"Proposed agent: {task.proposed_agent or 'Unavailable'}")
-                st.write(f"Required permissions: {', '.join(task.required_permissions) or 'none declared'}")
-                if task.missing_prerequisites:
-                    st.warning('Unavailable or missing: ' + '; '.join(task.missing_prerequisites))
-                approval = state.approvals.get(task.task_id)
-                if approval:
-                    current_decision = approval[1]
-                    st.caption('Approval status: ' + (current_decision.status.value if current_decision else 'Pending explicit decision'))
-                if task.proposed_agent is not None and not approval:
-                    if st.button('Review approval request', key=f'mission_approval_review_{task.task_id}'):
-                        try:
-                            mission_conversation.create_approval_request(state, task.task_id)
-                            st.rerun()
-                        except mission_conversation.MissionConversationError as error:
-                            st.error(str(error))
-                elif approval and approval[1] is None:
-                    approve_col, reject_col = st.columns(2)
-                    if approve_col.button('Approve this task', key=f'mission_approve_{task.task_id}'):
-                        try:
-                            mission_conversation.decide_approval(
-                                state, task.task_id, approved=True,
-                                human_identity='chat-user', reason='Explicit user approval from mission review UI')
-                            st.rerun()
-                        except mission_conversation.MissionConversationError as error:
-                            st.error(str(error))
-                    if reject_col.button('Reject this task', key=f'mission_reject_{task.task_id}'):
-                        try:
-                            mission_conversation.decide_approval(
-                                state, task.task_id, approved=False,
-                                human_identity='chat-user', reason='Explicit user rejection from mission review UI')
-                            st.rerun()
-                        except mission_conversation.MissionConversationError as error:
-                            st.error(str(error))
-        return
     if route.intent == 'mission_status':
-        from brain_core import mission_conversation
+        _save_user_message(session_id, user_text, 'mission_status')
+        mission_conversation_module = mission_conversation
         mission_state = st.session_state.get('_mission_conversations', {}).get(session_id)
         if mission_state is None:
             stored = conversation.load_mission_state(session_id, data_dir=studio.DATA, db_path=studio.DB)
             if stored:
                 try:
                     mission_state = mission_conversation.state_from_dict(stored[0])
+                    mission_state.synthetic_acceptance = False
                     st.session_state.setdefault('_mission_conversations', {})[session_id] = mission_state
                 except mission_conversation.MissionConversationError:
                     mission_state = None
@@ -1837,6 +1842,7 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
         _save_response(session_id, answer, 'mission_status')
         return
     if route.intent == 'capability_acknowledgement':
+        _save_user_message(session_id, user_text, 'capability_acknowledgement')
         from brain_core.capability_communication import CapabilityUpdateStore, store_path
         store = CapabilityUpdateStore(store_path(studio.DATA))
         update = store.pending()
@@ -1850,6 +1856,7 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
             _save_response(session_id, 'There is no new capability update awaiting acknowledgement.', 'capability_update_acknowledged')
         return
     if route.intent == 'capability_update':
+        _save_user_message(session_id, user_text, 'capability_update')
         from brain_core.capability_communication import CapabilityUpdateStore, store_path
         store = CapabilityUpdateStore(store_path(studio.DATA))
         update = store.pending() or store.latest()
@@ -1928,6 +1935,7 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
         _save_response(session_id, answer, 'agent_awareness')
         return
     if route.intent == 'general':
+        _save_user_message(session_id, user_text, 'user')
         _run_general_answer(user_text, session_id, profile, model_config)
         _render_cloud_approval(session_id)
         return
@@ -1950,13 +1958,16 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
         return
     if route.intent == 'general':
         if st.session_state.get('studio_inference') == 'Automatic (Local first)':
+            _save_user_message(session_id, user_text, 'user')
             _run_general_answer(user_text, session_id, profile, model_config)
             _render_cloud_approval(session_id)
             return
         if st.session_state.get('studio_inference') == 'Local model (Ollama)':
+            _save_user_message(session_id, user_text, 'user')
             _run_general_answer(user_text, session_id, profile, model_config)
             return
         if st.session_state.get('studio_inference') == 'OpenAI cloud':
+            _save_user_message(session_id, user_text, 'user')
             from brain_core.conversation_journey import PendingTurn
             approved = lessons.retrieve(user_text, limit=3, data_dir=studio.DATA, db_path=studio.DB)
             turn = PendingTurn(user_text, dict(profile), tuple(dict(item) for item in approved))
@@ -1970,14 +1981,24 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
                 st.warning('OpenAI could not prepare a safe factual-answer request. No external request was sent.')
             return
         if model_config is None and st.session_state.get('studio_inference') == 'Alibaba Qwen cloud':
+            _save_user_message(session_id, user_text, 'user')
             st.info('General factual answers require Local or explicitly approved OpenAI; no request was sent.')
             return
         if st.session_state.get('studio_inference') == 'Offline demonstration':
+            _save_user_message(session_id, user_text, 'user')
             st.info('Offline demonstration responses are fixtures and are not used for general factual answers.')
             return
+        _save_user_message(session_id, user_text, 'user')
         _run_general_answer(user_text, session_id, profile, model_config)
         return
     if route.intent != 'emotional_reasoning':
+        if route.intent == 'training':
+            _save_user_message(session_id, user_text, 'lesson_clarification')
+            _save_response(session_id,
+                           'Please clarify the principle you want to teach, or provide the lesson details for review.',
+                           'lesson_clarification')
+            return
+        _save_user_message(session_id, user_text, 'clarification')
         _save_response(session_id, 'I am not sure how to route that request. Could you clarify whether you want to chat, consider a situation, teach a principle, or recall an approved lesson?', 'clarification')
         return
     if st.session_state.get('studio_inference') == 'Automatic (Local first)':
@@ -1992,6 +2013,9 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
                                             data_dir=studio.DATA, db_path=studio.DB)
         _offer_selected_cloud(user_text, session_id, profile, approved_lessons, provider=provider)
         return
+    service = service_module
+    trainer = trainer_module
+    lessons = lessons_module
     try:
         with st.status('Considering your message…', expanded=False):
             reasoning_context = service.cognition.assess(user_text, profile, {'emotions': dict(NEUTRAL)})
@@ -2049,6 +2073,9 @@ def _handle_message(user_text, session_id, history_messages, profile, model_conf
 
 
 def render_conversation(profile, ready, model_config, configuration_error):
+    execution_module = mission_execution
+    mission_conversation_module = mission_conversation
+    mission_execution_ui_module = mission_execution_ui
     chat_error = st.session_state.get('chat_error')
     if chat_error:
         st.warning(chat_error)
@@ -2123,8 +2150,21 @@ def render_conversation(profile, ready, model_config, configuration_error):
     st.caption('Model: ' + ('available' if ready else 'not available; lessons and recall remain available'))
     history = conversation.load_messages(session_id, data_dir=studio.DATA, db_path=studio.DB)
     _rendered_notices = st.session_state.setdefault('_capability_notices_rendered', set())
+    mission_state = st.session_state.get('_mission_conversations', {}).get(session_id)
+    if mission_state is None:
+        stored_mission = conversation.load_mission_state(session_id, data_dir=studio.DATA, db_path=studio.DB)
+        if stored_mission:
+            try:
+                mission_state = mission_conversation_module.state_from_dict(stored_mission[0])
+                mission_state.synthetic_acceptance = False
+                st.session_state.setdefault('_mission_conversations', {})[session_id] = mission_state
+            except (mission_conversation_module.MissionConversationError, ValueError, TypeError, KeyError):
+                mission_state = None
     for item in history:
         notice_key = item.get('related_lesson_id') if item.get('message_type') == 'capability_update_notice' else None
+        if (item.get('role') == 'assistant' and item.get('message_type') == 'mission_execution'
+                and 'disabled in chat' in item.get('content', '')):
+            st.info(item['content'])
         if notice_key:
             _rendered_notices.add(notice_key)
         with st.chat_message(item['role']):
@@ -2160,6 +2200,9 @@ def render_conversation(profile, ready, model_config, configuration_error):
     if user_text:
         _handle_message(user_text, session_id, history, profile, model_config, configuration_error)
         st.rerun()
+    mission_execution_ui_module.render(
+        st, conversation, mission_conversation_module, mission_controller, execution_module,
+        session_id, studio.DATA, studio.DB)
     _render_cloud_approval(session_id)
 
 

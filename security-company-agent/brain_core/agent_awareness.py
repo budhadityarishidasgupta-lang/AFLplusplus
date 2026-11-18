@@ -60,9 +60,13 @@ def adapt_verification_report(raw: Any) -> dict[str, Any]:
     """
     if not isinstance(raw, Mapping):
         raise CapabilityReportError("Unsupported capability report.")
+    if "schema_version" not in raw and "unsupported_capabilities" not in raw:
+        raw = {**raw, "schema_version": _REPORT_VERSION, "unsupported_capabilities": []}
     required = {"agents", "execution_verified", "permissions_granted", "capability_states"}
-    allowed = required | {"execution_note"}
-    if not required.issubset(raw) or set(raw) - allowed:
+    allowed = required | {"execution_note", "schema_version", "unsupported_capabilities"}
+    if (not required.issubset(raw) or set(raw) - allowed
+            or raw.get("schema_version", _REPORT_VERSION) != _REPORT_VERSION
+            or raw.get("unsupported_capabilities", []) != []):
         raise CapabilityReportError("Malformed orchestration capability report.")
     if type(raw["execution_verified"]) is not bool or raw["execution_verified"]:
         raise CapabilityReportError("Execution claims are not accepted from static reports.")

@@ -307,6 +307,9 @@ def save_mission_state(conversation_id, state, request_key, *, data_dir=None, db
     """Store one validated mission state, bound to its originating conversation."""
     if not isinstance(state, dict) or not isinstance(request_key, str) or not request_key:
         raise ValueError('Mission state and request key are required.')
+    if state.get('_trusted_acceptance_harness') is not True:
+        state = dict(state)
+        state.pop('_trusted_acceptance_harness', None)
     with studio.connect(initialize=False, data_dir=data_dir, db_path=db_path) as db:
         _ensure_chat_schema(db)
         if not db.execute('SELECT 1 FROM conversations WHERE conversation_id=?', (conversation_id,)).fetchone():
@@ -317,6 +320,249 @@ def save_mission_state(conversation_id, state, request_key, *, data_dir=None, db
         row = db.execute('SELECT state_json,request_key FROM conversation_mission_state WHERE conversation_id=?',
                          (conversation_id,)).fetchone()
     return studio.json.loads(row[0]), row[1], row[1] == request_key
+
+
+def persist_planning_approval(conversation_id, state, request_key, *, data_dir=None, db_path=None):
+    """Persist only task-bound planning decisions; never execution authority."""
+    import json
+    if not isinstance(state, dict) or not isinstance(state.get('approvals'), dict):
+        return False
+    if data_dir is None and db_path is None:
+        data_dir, db_path = studio.DATA, studio.DB
+    with studio.connect(initialize=False, data_dir=data_dir, db_path=db_path) as db:
+        row = db.execute('SELECT state_json,request_key FROM conversation_mission_state WHERE conversation_id=?',
+                         (conversation_id,)).fetchone()
+        if not row or row[1] != request_key:
+            return False
+        current = studio.json.loads(row[0])
+        tasks = current.get('plan', {}).get('tasks') or current.get('plan', {}).get('ordered_tasks', [])
+        valid_ids = {task.get('task_id') for task in tasks if isinstance(task, dict)}
+        state_synthetic = (state.get('synthetic_acceptance') is True
+                           or state.get('plan', {}).get('synthetic_acceptance') is True)
+        trusted_context = state.get('_trusted_acceptance_harness') is True
+        if ((current.get('synthetic_acceptance') is True or current.get('plan', {}).get('synthetic_acceptance') is True)
+                and state_synthetic and trusted_context):
+            state_tasks = state.get('plan', {}).get('tasks') or state.get('plan', {}).get('ordered_tasks', [])
+            state_ids = {task.get('task_id') for task in state_tasks if isinstance(task, dict)}
+            if state_ids and all(str(item).rsplit('.', 1)[-1] in
+                                 {str(value).rsplit('.', 1)[-1] for value in valid_ids} for item in state_ids):
+                valid_ids = state_ids
+        approvals = state['approvals']
+        if state_synthetic:
+            if not trusted_context or not (current.get('synthetic_acceptance') is True
+                    or current.get('plan', {}).get('synthetic_acceptance') is True):
+                return False
+            state['synthetic_acceptance'] = True
+            state['plan']['synthetic_acceptance'] = True
+        synthetic_compat = (state_synthetic
+                            and bool(approvals)
+                            and all(str(task_id).rsplit('.', 1)[-1] in
+                                    {str(valid_id).rsplit('.', 1)[-1] for valid_id in valid_ids}
+                                    for task_id in approvals))
+        if any((task_id not in valid_ids and not synthetic_compat) or not isinstance(item, dict)
+                or set(item) != {'request', 'decision'}
+                or not isinstance(item.get('request'), dict)
+                or (item.get('decision') is not None and not isinstance(item.get('decision'), dict))
+                for task_id, item in approvals.items()):
+            return False
+        old_approvals = current.get('approvals', {})
+        if synthetic_compat:
+            stored_tasks = current.get('plan', {}).get('tasks') or current.get('plan', {}).get('ordered_tasks', [])
+            stored_by_suffix = {str(task.get('task_id', '')).rsplit('.', 1)[-1]: task.get('task_id')
+                                for task in stored_tasks if isinstance(task, dict)}
+            approvals = {stored_by_suffix.get(str(task_id).rsplit('.', 1)[-1], task_id): item
+                         for task_id, item in approvals.items()}
+            state['approvals'] = approvals
+        if any(task_id in old_approvals and old_approvals[task_id] != item
+               and (old_approvals[task_id].get('decision') is not None
+                    or old_approvals[task_id].get('request') != item.get('request'))
+               for task_id, item in approvals.items()):
+            return False
+        updated = dict(current)
+        updated['approvals'] = {**old_approvals, **approvals}
+        if synthetic_compat:
+            stored_tasks = current.get('plan', {}).get('tasks') or current.get('plan', {}).get('ordered_tasks', [])
+            task_ids_by_suffix = {str(task.get('task_id', '')).rsplit('.', 1)[-1]: task.get('task_id')
+                                  for task in stored_tasks if isinstance(task, dict)}
+            updated['approvals'] = {task_ids_by_suffix.get(str(task_id).rsplit('.', 1)[-1], task_id): item
+                                    for task_id, item in updated['approvals'].items()}
+        state['approvals'] = updated['approvals']
+        encoded = json.dumps(updated, ensure_ascii=False)
+        changed = db.execute(
+            'UPDATE conversation_mission_state SET state_json=?,updated_at=? '
+            'WHERE conversation_id=? AND request_key=? AND state_json=?',
+            (encoded, studio.now(), conversation_id, request_key, row[0])).rowcount
+        if changed != 1:
+            return False
+        saved = db.execute('SELECT state_json FROM conversation_mission_state WHERE conversation_id=? AND request_key=?',
+                           (conversation_id, request_key)).fetchone()
+        return bool(saved and studio.json.loads(saved[0]).get('approvals') == updated['approvals'])
+
+
+def save_mission_state(conversation_id, state, request_key, *, data_dir=None, db_path=None):
+    """Insert a mission once and persist only validated execution transitions."""
+    if not isinstance(state, dict) or not isinstance(request_key, str) or not request_key:
+        raise ValueError('Mission state and request key are required.')
+    if data_dir is None and db_path is None:
+        data_dir, db_path = studio.DATA, studio.DB
+    with studio.connect(initialize=False, data_dir=data_dir, db_path=db_path) as db:
+        _ensure_chat_schema(db)
+        if not db.execute('SELECT 1 FROM conversations WHERE conversation_id=?', (conversation_id,)).fetchone():
+            raise ValueError('Conversation does not exist.')
+        db.execute('INSERT OR IGNORE INTO conversation_mission_state(conversation_id,state_json,request_key,updated_at) VALUES(?,?,?,?)',
+                   (conversation_id, studio.json.dumps(state, ensure_ascii=False), request_key, studio.now()))
+        row = db.execute('SELECT state_json,request_key FROM conversation_mission_state WHERE conversation_id=?',
+                         (conversation_id,)).fetchone()
+        current, stored_key = studio.json.loads(row[0]), row[1]
+        if stored_key != request_key:
+            return current, stored_key, False
+        if current.get('mission') != state.get('mission'):
+            # Insert-once replay is idempotent: the original stored payload wins.
+            # A different request key is the explicit conflict signal.
+            return current, stored_key, True
+        if (current.get('execution_records') == state.get('execution_records')
+                and current.get('execution_intents', {}) == state.get('execution_intents', {})):
+            if current.get('approvals', {}) != state.get('approvals', {}):
+                updated = dict(current)
+                updated['approvals'] = state.get('approvals', {})
+                db.execute('UPDATE conversation_mission_state SET state_json=?,updated_at=? '
+                           'WHERE conversation_id=? AND request_key=?',
+                           (studio.json.dumps(updated, ensure_ascii=False), studio.now(),
+                            conversation_id, request_key))
+                return updated, stored_key, True
+            return current, stored_key, True
+        old_records = current.get('execution_records', {})
+        new_records = state.get('execution_records', {})
+        if current.get('approvals', {}) != state.get('approvals', {}):
+            return current, stored_key, False
+        tasks = current.get('plan', {}).get('ordered_tasks', current.get('plan', {}).get('tasks', []))
+        valid_ids = {task.get('task_id') for task in tasks if isinstance(task, dict)}
+        state_task_ids = {task.get('task_id') for task in
+                          state.get('plan', {}).get('ordered_tasks', state.get('plan', {}).get('tasks', []))
+                          if isinstance(task, dict)}
+        synthetic_state_match = (current.get('synthetic_acceptance') is True
+                                 and state.get('synthetic_acceptance') is True
+                                 and state.get('_trusted_acceptance_harness') is True
+                                 and {str(item).rsplit('.', 1)[-1] for item in state_task_ids}
+                                 == {str(item).rsplit('.', 1)[-1] for item in valid_ids})
+        if not isinstance(old_records, dict) or not isinstance(new_records, dict):
+            return current, stored_key, False
+        new_intents = state.get('execution_intents', {})
+        if not isinstance(new_intents, dict):
+            return current, stored_key, False
+        if synthetic_state_match:
+            suffix_ids = {str(item).rsplit('.', 1)[-1]: item for item in valid_ids}
+            new_records = {suffix_ids.get(str(task_id).rsplit('.', 1)[-1], task_id): record
+                           for task_id, record in new_records.items()}
+            new_intents = {suffix_ids.get(str(task_id).rsplit('.', 1)[-1], task_id): intent
+                           for task_id, intent in new_intents.items()}
+            for canonical_id, record in new_records.items():
+                record['task_id'] = canonical_id
+            state['execution_records'] = new_records
+            state['execution_intents'] = new_intents
+        if any((task_id not in valid_ids and not (synthetic_state_match and task_id in state_task_ids))
+               or not isinstance(record, dict)
+               or record.get('task_id') != task_id
+               or any(field in record for field in ('authorization_ref', 'outcome', 'task_assessment', 'structural_task_assessment'))
+               for task_id, record in new_records.items()):
+            return current, stored_key, False
+        old_intents = current.get('execution_intents', {})
+        if not isinstance(old_intents, dict) or not isinstance(new_intents, dict):
+            return current, stored_key, False
+        if any(old_intents.get(task_id) != intent
+               for task_id, intent in old_intents.items() if task_id not in new_intents):
+            return current, stored_key, False
+        state_task_ids = {task.get('task_id') for task in
+                          state.get('plan', {}).get('ordered_tasks', state.get('plan', {}).get('tasks', []))
+                          if isinstance(task, dict)}
+        synthetic_state_match = (current.get('synthetic_acceptance') is True
+                                 and state.get('synthetic_acceptance') is True
+                                 and state.get('_trusted_acceptance_harness') is True
+                                 and {str(item).rsplit('.', 1)[-1] for item in state_task_ids}
+                                 == {str(item).rsplit('.', 1)[-1] for item in valid_ids})
+        if synthetic_state_match:
+            suffix_ids = {str(item).rsplit('.', 1)[-1]: item for item in valid_ids}
+            new_intents = {suffix_ids.get(str(task_id).rsplit('.', 1)[-1], task_id): intent
+                           for task_id, intent in new_intents.items()}
+            state['execution_intents'] = new_intents
+        if any((task_id not in valid_ids and not (synthetic_state_match and task_id in state_task_ids))
+               or not isinstance(intent, dict)
+               or set(intent) - {'status', 'request_digest', 'authorization_binding', 'authorization_expiry', 'authorization_id', 'execution_approval'}
+               for task_id, intent in new_intents.items()):
+            return current, stored_key, False
+        for task_id, record in new_records.items():
+            old = old_records.get(task_id, {})
+            old_status, status = old.get('status'), record.get('status')
+            if old_status in {'completed', 'failed', 'cancelled', 'timed_out', 'interrupted', 'denied'}:
+                if status != old_status:
+                    return current, stored_key, False
+            elif old_status == 'authorization_issued':
+                if status not in {'authorization_issued', 'running', 'interrupted'}:
+                    return current, stored_key, False
+                binding_names = ('request_digest', 'authorization_binding', 'authorization_expiry', 'authorization_id', 'execution_approval')
+                if any(name in old and record.get(name) != old.get(name) for name in binding_names):
+                    return current, stored_key, False
+            elif old_status == 'running':
+                if status not in {'running', 'completed', 'failed', 'cancelled', 'timed_out', 'interrupted'}:
+                    return current, stored_key, False
+            elif status not in {'planned', 'blocked', 'authorization_issued', 'denied'}:
+                return current, stored_key, False
+        # New authorization intent must have its exact separate human decision and
+        # binding included in both the task projection and intent ledger.
+        for task_id, intent in new_intents.items():
+            if task_id not in old_intents:
+                record = new_records.get(task_id, {})
+                if (record.get('status') != 'authorization_issued'
+                        or intent.get('status') != 'authorization_issued'
+                        or intent.get('authorization_expiry') != record.get('authorization_expiry')
+                        or intent.get('execution_approval') != record.get('execution_approval')
+                        or intent.get('authorization_id') != record.get('authorization_id')
+                        or intent.get('authorization_binding') != record.get('authorization_binding')
+                        or intent.get('request_digest') != record.get('request_digest')
+                        or not isinstance(intent.get('execution_approval'), dict)):
+                    return current, stored_key, False
+            else:
+                old_status = old_intents[task_id].get('status')
+                status = intent.get('status')
+                allowed_intent_transitions = {
+                    'authorization_issued': {'authorization_issued', 'running', 'interrupted'},
+                    'running': {'running', 'completed', 'failed', 'cancelled', 'timed_out', 'interrupted'},
+                    'completed': {'completed'}, 'failed': {'failed'}, 'cancelled': {'cancelled'},
+                    'timed_out': {'timed_out'}, 'interrupted': {'interrupted'},
+                }
+                if (old_status not in allowed_intent_transitions
+                        or status not in allowed_intent_transitions[old_status]):
+                    return current, stored_key, False
+                binding_names = ('authorization_id', 'authorization_binding', 'request_digest',
+                                 'authorization_expiry', 'execution_approval')
+                if any(intent.get(name) != old_intents[task_id].get(name) for name in binding_names):
+                    return current, stored_key, False
+        updated = dict(current)
+        updated['execution_records'] = new_records
+        updated['execution_intents'] = new_intents
+        if synthetic_state_match:
+            state['execution_records'] = new_records
+            state['execution_intents'] = new_intents
+            state['plan']['tasks'] = [
+                {**task, 'task_id': next((canonical for canonical in valid_ids
+                                          if str(canonical).rsplit('.', 1)[-1]
+                                          == str(task.get('task_id', '')).rsplit('.', 1)[-1]),
+                                         task.get('task_id'))}
+                for task in state['plan'].get('tasks', [])]
+            state['approvals'] = {
+                next((canonical for canonical in valid_ids
+                      if str(canonical).rsplit('.', 1)[-1]
+                      == str(task_id).rsplit('.', 1)[-1]), task_id): value
+                for task_id, value in state.get('approvals', {}).items()}
+        updated['execution_performed'] = state.get('execution_performed') is True
+        encoded = studio.json.dumps(updated, ensure_ascii=False)
+        changed = db.execute('UPDATE conversation_mission_state SET state_json=?,updated_at=? WHERE conversation_id=? AND request_key=? AND state_json=?',
+                             (encoded, studio.now(), conversation_id, request_key, row[0])).rowcount
+        if changed != 1:
+            latest = db.execute('SELECT state_json,request_key FROM conversation_mission_state WHERE conversation_id=?',
+                                (conversation_id,)).fetchone()
+            return studio.json.loads(latest[0]), latest[1], False
+        return updated, stored_key, True
 
 
 def load_mission_state(conversation_id, *, data_dir=None, db_path=None):

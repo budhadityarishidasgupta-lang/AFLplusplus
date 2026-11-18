@@ -54,8 +54,18 @@ def make_state(objective="Research the best local AI model for my laptop."):
             capability["execution_readiness"]["ready"] = False
             capability["execution_readiness"]["reason"] = "Execution integration unavailable."
     fingerprint = agent_awareness.report_fingerprint(raw)
-    return mission_conversation.build_mission(
+    raw["synthetic_acceptance"] = True
+    from brain_core import mission_execution
+    harness = mission_execution._TRUSTED_ACCEPTANCE_HARNESS
+    from control_plane.agent_contracts import CapabilityRegistry
+    import tempfile
+    service = mission_execution.MissionExecutionService.synthetic(
+        store_path=Path(tempfile.mkdtemp()) / "fixture.sqlite3",
+        registry=CapabilityRegistry(), _acceptance_context=harness)
+    raw["_fixture_discovery"] = service.mission_capability_discovery(_acceptance_context=harness)
+    state = mission_conversation.build_mission(
         objective, raw, report_fingerprint=fingerprint, conversation_id="synthetic-chat")
+    return state
 
 
 def test_ordinary_conversation_is_not_routed_as_mission():
@@ -68,7 +78,7 @@ def test_mission_plan_and_availability_are_presented_without_execution():
     state = make_state("Plan a local fuzzing campaign for this synthetic target.")
     rendered = mission_conversation.describe_state(state)
     assert "Objective:" in rendered and "Success criteria:" in rendered
-    assert "planned, not running" in rendered
+    assert "mission planned" in rendered
     assert "Required permissions:" in rendered
     assert "No task was executed" in rendered
     assert state.to_dict()["execution_performed"] is False
@@ -122,10 +132,9 @@ def test_unverified_result_never_claims_completion():
     result = execution.ExecutionResult(
         task.task_id, state.mission.mission_id, task.proposed_agent,
         execution.ExecutionState.COMPLETED, output={})
-    assessment = mission_conversation.record_synthetic_result(state, task.task_id, result=result)
-    assert not assessment.completed
-    assert assessment.uncertainties
-    assert not any(item.completed for item in state.outcomes.values())
+    with pytest.raises(mission_conversation.MissionConversationError, match="durable engine-recorded completion"):
+        mission_conversation.record_synthetic_result(state, task.task_id, result=result)
+    assert not state.outcomes
 
 
 def test_capability_announcement_is_preserved_and_memory_separate():
@@ -135,11 +144,12 @@ def test_capability_announcement_is_preserved_and_memory_separate():
     assert "memory" not in mission_conversation.MissionConversationState.__annotations__
 
 
-def test_orchestration_uses_verified_external_worktree_without_execution():
+def test_orchestration_uses_brain_local_reviewed_source_without_execution():
     modules = mission_conversation._orchestration()
-    assert all(Path(module.__file__).resolve().is_relative_to(ORCHESTRATION.resolve())
+    brain_control_plane = REPO / "control_plane"
+    assert all(Path(module.__file__).resolve().is_relative_to(brain_control_plane.resolve())
                for module in modules)
-    source = (ORCHESTRATION / "control_plane" / "execution_engine.py").read_text(encoding="utf-8")
+    source = (brain_control_plane / "execution_engine.py").read_text(encoding="utf-8")
     assert "only structurally valid synthetic adapters" in source
     assert "legacy specialists" in source
     assert conversation.classify_intent("Which agents are unavailable?").intent == "agent_awareness"
