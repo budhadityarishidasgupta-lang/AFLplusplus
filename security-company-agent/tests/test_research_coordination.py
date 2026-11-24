@@ -26,6 +26,20 @@ class ResearchCoordinationTests(unittest.TestCase):
         return ResearchCoordinator(reasoning_runner=reasoning, search_runner=research,
                                    authorization_ledger=ledger or self._ledger())
 
+    def test_gateway_configuration_errors_propagate_without_secrets(self):
+        for status in ('missing_token', 'not_approved', 'invalid_endpoint'):
+            with self.subTest(status=status):
+                reasoning = Mock(return_value=FallbackState.SUCCESS)
+                research = Mock(return_value={'status': status, 'results': [],
+                                              'error': 'synthetic-gateway-token'})
+                result = self._coordinator(reasoning, research).run(
+                    query='synthetic query', research_authorized=True,
+                    journey_id=f'journey-{status}', authorization_id=f'approval-{status}')
+                self.assertEqual(result.research_status, status)
+                self.assertEqual(result.research_diagnostic, status)
+                self.assertEqual(result.evidence, ())
+                self.assertNotIn('synthetic-gateway-token', repr(result))
+
     def test_reasoning_and_research_both_succeed_and_preserve_evidence(self):
         evidence = ({'title': 'Synthetic source', 'url': 'https://example.test/',
                      'snippet': 'Evidence snippet', 'source': {'provider': 'brave'}},)
@@ -159,6 +173,7 @@ class ResearchCoordinationTests(unittest.TestCase):
             query='synthetic query', reasoning_authorized=True)
         self.assertEqual(result.reasoning_status, FallbackState.SUCCESS)
         self.assertEqual(result.research_status, 'awaiting_authorization')
+        self.assertEqual(result.evidence, ())
         research.assert_not_called()
 
 
