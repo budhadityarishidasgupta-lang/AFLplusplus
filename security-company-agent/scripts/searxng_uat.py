@@ -2,6 +2,8 @@
 
 Run explicitly with --live only after credential rotation is confirmed. Default mode
 performs local configuration/preflight checks and reports production tests BLOCKED.
+Use --config-dir with --config-dir-approved to read allowlisted SearXNG values from an
+owner-approved external directory; the runner never copies or modifies that directory's .env.
 This module never imports Brain/provider code and never reads Alibaba/OpenAI keys.
 """
 from __future__ import annotations
@@ -27,15 +29,79 @@ TIMEOUT_SECONDS = 8
 RESPONSE_LIMIT = 1_048_576
 
 
-def _load_search_config() -> tuple[str | None, str | None, str | None]:
-    """Read only the three SearXNG fields in-process; never return them to output."""
-    path = ROOT / ".env"
-    if not path.is_file():
+def _config_file(config_dir: str | Path | None = None) -> Path | None:
+    """Resolve a configuration directory and reject redirected/symlink paths."""
+    try:
+        if config_dir is None:
+            directory = ROOT
+        else:
+            requested = Path(config_dir).expanduser()
+            if not requested.is_absolute():
+                return None
+            directory = requested
+        if not directory.is_absolute() or not directory.exists() or not directory.is_dir():
+            return None
+        if config_dir is not None:
+            resolved_requested = directory.resolve(strict=True)
+            current = directory.absolute()
+            while current != current.parent:
+                if current.is_symlink():
+                    return None
+                current = current.parent
+            if not resolved_requested.samefile(directory):
+                return None
+            external_env = resolved_requested / ".env"
+            if not external_env.exists() or external_env.is_symlink() or not external_env.is_file():
+                return None
+            return external_env
+        resolved_directory = directory.resolve(strict=True)
+        if not resolved_directory.is_dir() or not resolved_directory.samefile(directory):
+            return None
+        current = directory.absolute()
+        while current != current.parent:
+            if current.is_symlink():
+                return None
+            current = current.parent
+        path = resolved_directory / ".env"
+        if not path.exists() or path.is_symlink() or not path.is_file() or not path.resolve(strict=True).samefile(path):
+            return None
+        return path
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _load_search_config(config_dir: str | Path | None = None, *, approved: bool = False) -> tuple[str | None, str | None, str | None]:
+    """Read only allowlisted SearXNG fields, opening the checked file without following symlinks."""
+    path = _config_file(config_dir)
+    if path is None or (config_dir is not None and not approved):
         return None, None, None
     selected: dict[str, str] = {}
     wanted = {"SEARXNG_ENDPOINT", "SEARXNG_API_TOKEN", "SEARXNG_APPROVED"}
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
+        if config_dir is None:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        else:
+            import os
+            import stat
+            if os.name == "nt":
+                resolved = path.resolve(strict=True)
+                if not resolved.samefile(path):
+                    return None, None, None
+                lines = resolved.read_text(encoding="utf-8").splitlines()
+            elif not hasattr(os, "O_NOFOLLOW"):
+                return None, None, None
+            else:
+                if not path.resolve(strict=True).samefile(path):
+                    return None, None, None
+                flags = os.O_RDONLY | os.O_NOFOLLOW
+                descriptor = os.open(path, flags)
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode):
+                    os.close(descriptor)
+                    return None, None, None
+                with os.fdopen(descriptor, "r", encoding="utf-8") as config_stream:
+                    lines = config_stream.read().splitlines()
+        for line in lines:
             item = line.strip()
             if not item or item.startswith("#") or "=" not in item:
                 continue
@@ -213,15 +279,37 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live", action="store_true", help="allow bounded read-only HTTPS requests (requires operator confirmation)")
     parser.add_argument("--credential-rotation-confirmed", action="store_true", help="required with --live")
+    parser.add_argument("--config-dir", help="absolute path to a local configuration directory")
+    parser.add_argument("--config-dir-approved", action="store_true", help="explicitly confirm the external directory is owner-approved")
     args = parser.parse_args(argv)
-    endpoint, token, approval = _load_search_config()
+    if args.config_dir_approved and args.config_dir is None:
+        parser.error("--config-dir-approved requires --config-dir")
+    if args.config_dir is not None and not args.config_dir_approved:
+        print("UAT_PREFLIGHT: BLOCKED (external configuration requires explicit approval)")
+        print("SEARXNG_APPROVAL_UNCHANGED: BLOCKED")
+        for row in _rows(False, False):
+            print(f"{row['result']} | {row['test']} | expected: {row['expected']} | observed: {row['observed']}")
+        return 1
+    config_file = _config_file(args.config_dir)
+    if args.config_dir is not None and config_file is None:
+        print("UAT_PREFLIGHT: BLOCKED (configuration path unavailable or unsafe)")
+        print("SEARXNG_APPROVAL_UNCHANGED: BLOCKED")
+        for row in _rows(False, False):
+            print(f"{row['result']} | {row['test']} | expected: {row['expected']} | observed: {row['observed']}")
+        return 1
+    endpoint, token, approval = _load_search_config(args.config_dir, approved=args.config_dir_approved)
     configured = _valid_endpoint(endpoint) and bool(token)
     global _TOKEN
     _TOKEN = token if configured else None
     # Approval is observed in memory only; never changed. Live testing requires it remain disabled.
     approval_disabled = (approval or "").casefold() in {"0", "false", "no"}
+    config_valid = config_file is not None and (args.config_dir is None or args.config_dir_approved)
+    configured = configured and config_valid
+    if not config_valid:
+        token = None
+        _TOKEN = None
     live_allowed = args.live and args.credential_rotation_confirmed and configured and approval_disabled
-    print("UAT_PREFLIGHT: " + ("PASS" if configured and approval_disabled else "BLOCKED"))
+    print("UAT_PREFLIGHT: " + ("PASS" if config_valid and configured and approval_disabled else "BLOCKED"))
     print("SEARXNG_APPROVAL_UNCHANGED: " + ("PASS" if approval_disabled else "BLOCKED"))
     if args.live and not live_allowed:
         print("LIVE_UAT_AUTHORIZATION: BLOCKED (requires configured endpoint/token, approval disabled, and explicit rotation confirmation)")

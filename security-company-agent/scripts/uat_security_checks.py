@@ -42,13 +42,16 @@ def _scan_content(paths: list[tuple[str, str]]) -> list[tuple[str, str, int]]:
         ("openai_assignment", re.compile(r"(?i)OPENAI_API_KEY\s*=\s*['\"]?(?!sk-(?:proj|svcacct|live|test)-)[A-Za-z0-9._~+/=-]{16,}")),
         ("alibaba_assignment", re.compile(r"(?i)DASHSCOPE_API_KEY\s*=\s*['\"]?(?!sk-ws-)[A-Za-z0-9._~+/=-]{16,}")),
         ("bearer_token", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{24,}")),
-        ("credential_assignment", re.compile(r"(?i)(?:SEARXNG_API_TOKEN|BRAVE_API_KEY|ACCESS_TOKEN)\s*=\s*['\"]?[A-Za-z0-9._~+/=-]{24,}")),
+        ("credential_assignment", re.compile(r"(?i)(?:SEARXNG_API_TOKEN|BRAVE_API_KEY|ACCESS_TOKEN)\s*=\s*['\"]?[A-Za-z0-9._~+/=-]{16,}")),
         ("private_key_block", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
     )
     findings: list[tuple[str, str, int]] = []
     for path, content in paths:
         categories: dict[str, int] = {}
-        if Path(path).name == ".env" or Path(path).name.startswith(".env."):
+        filename = Path(path).name
+        is_env_file = filename == ".env" or filename.startswith(".env.")
+        is_template = filename == ".env.example"
+        if is_env_file and not is_template:
             categories["tracked_env_file"] = 1
         for category, pattern in rules:
             count = sum(1 for _ in pattern.finditer(content))
@@ -131,7 +134,9 @@ def scan_tracked_files(root: Path = ROOT, *, git_runner=None) -> tuple[bool, lis
                 return False, []
             if candidate.exists() and not candidate.is_file():
                 return False, []
-            if candidate.name == ".env" or candidate.name.startswith(".env.") or candidate.suffix.lower() in allowed:
+            is_environment_file = candidate.name == ".env" or candidate.name.startswith(".env.")
+            is_template = candidate.name == ".env.example"
+            if is_environment_file or is_template or candidate.suffix.lower() in allowed:
                 content_pairs.append((relative, candidate.read_text(encoding="utf-8", errors="ignore")))
         return True, _scan_content(content_pairs)
     except Exception:
