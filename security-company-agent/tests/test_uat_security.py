@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import socket
+import ssl
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,7 +127,7 @@ class UatSecurityTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertNotIn(secret_marker, rendered)
         self.assertNotIn(secret_token, rendered)
-        self.assertIn("Request failed; exception details suppressed", rendered)
+        self.assertIn("diagnostic=UNKNOWN_NETWORK_ERROR", rendered)
 
     def test_config_file_symlink_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -230,6 +234,84 @@ class UatSecurityTests(unittest.TestCase):
         self.assertNotIn("dummy-only-token", captured["url"])
         self.assertEqual(captured["auth"], f"{('Bear' + 'er')} dummy-only-token")
         self.assertLessEqual(captured["timeout"], 15)
+
+    def test_health_shape_and_anonymous_401_shape_validation(self):
+        self.assertFalse(uat._health_ok(200, b"not-json"))
+        self.assertFalse(uat._health_ok(200, b"[]"))
+        self.assertFalse(uat._health_ok(503, b'{"status":"ok"}'))
+        self.assertTrue(uat._health_ok(200, b'{"status":"ok"}'))
+        self.assertFalse(uat._anonymous_ok(401, b"not-json"))
+        self.assertFalse(uat._anonymous_ok(401, b"[]"))
+        self.assertTrue(uat._anonymous_ok(401, b'{"error":"unauthorized"}'))
+        self.assertFalse(uat._anonymous_ok(200, b'{"error":"unauthorized"}'))
+
+    def test_diagnostics_preserve_http_statuses_and_sanitize_connection_failures(self):
+        class HttpErrorOpener:
+            def open(self, request, timeout):
+                raise urllib.error.HTTPError(request.full_url, 503, "private response header", {}, None)
+        with patch.object(uat.urllib.request, "build_opener", return_value=HttpErrorOpener()):
+            status, _body, _elapsed = uat._http("/healthz")
+        self.assertEqual(status, 503)
+        with patch.object(uat.urllib.request, "build_opener", side_effect=ConnectionError("private connection detail")):
+            try:
+                uat._http("/healthz")
+            except Exception as exc:
+                self.assertEqual(uat._diagnostic_category(exc), "CONNECTION_ERROR")
+
+    def test_http_failure_categories_are_fixed_and_sanitized(self):
+        cases = [
+            (urllib.error.URLError(socket.gaierror("secret-host-marker")), "DNS_FAILURE"),
+            (urllib.error.URLError(ssl.SSLError("private TLS detail")), "TLS_FAILURE"),
+            (TimeoutError("secret timeout detail"), "CONNECT_TIMEOUT"),
+            (urllib.error.URLError("proxy secret user:pass"), "PROXY_ERROR"),
+            (ConnectionError("secret connection detail"), "CONNECTION_ERROR"),
+            (ValueError("secret parser detail"), "RESPONSE_FORMAT_ERROR"),
+            (RuntimeError("secret unexpected detail"), "UNKNOWN_NETWORK_ERROR"),
+        ]
+        cases.extend([
+            (TimeoutError("read timeout detail"), "CONNECT_TIMEOUT"),
+            (socket.timeout("read timeout detail"), "CONNECT_TIMEOUT"),
+            (urllib.error.URLError(ConnectionRefusedError("private proxy detail")), "PROXY_ERROR"),
+        ])
+        with patch.object(uat, "_proxy_configured", return_value=True):
+            for exc, category in cases:
+                with self.subTest(category=category):
+                    with patch.object(uat.urllib.request, "build_opener", side_effect=exc):
+                        try:
+                            uat._http("/healthz")
+                        except Exception as caught:
+                            rendered = uat._diagnostic_category(caught)
+                        else:
+                            self.fail("transport error expected")
+                    self.assertIn(rendered, uat.DIAGNOSTIC_CATEGORIES)
+                    self.assertEqual(rendered, category)
+                    self.assertNotIn("secret", rendered.casefold())
+                    self.assertNotIn("private", rendered.casefold())
+
+    def test_http_error_is_returned_and_transport_proxy_state_is_boolean_only(self):
+        class ErrorOpener:
+            def open(self, request, timeout):
+                raise urllib.error.HTTPError(request.full_url, 401, "dummy response", {}, None)
+        with patch.object(uat.urllib.request, "build_opener", return_value=ErrorOpener()):
+            status, body, _ = uat._http("/search", query="Python")
+        self.assertEqual(status, 401)
+        self.assertEqual(uat._proxy_configured({"https": "http://user:secret@proxy.invalid"}), True)
+        self.assertEqual(uat._proxy_configured({}), False)
+        self.assertNotIn("proxy.invalid", repr(uat._proxy_configured({"https": "http://user:secret@proxy.invalid"})))
+        with patch.object(uat.urllib.request, "getproxies", return_value={"https": "http://proxy.invalid"}):
+            self.assertTrue(uat._proxy_configured())
+
+    def test_fixed_host_no_redirect_and_bounded_request_remain(self):
+        self.assertTrue(uat._valid_endpoint("https://sovereign-brain-search.onrender.com/search"))
+        with patch.object(uat.urllib.request, "build_opener") as build:
+            build.side_effect = RuntimeError("private detail")
+            try:
+                uat._http("/healthz", timeout=999)
+            except RuntimeError:
+                pass
+        self.assertTrue(any(isinstance(h, uat._NoRedirect) for h in build.call_args.args))
+        self.assertTrue(any(isinstance(h, uat.urllib.request.ProxyHandler) and h.proxies == {}
+                            for h in build.call_args.args))
 
     def test_scanner_detects_dummy_credentials_in_removed_temporary_files(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import socket
 import ssl
 import sys
 import time
@@ -27,6 +28,52 @@ QUERIES = (
 )
 TIMEOUT_SECONDS = 8
 RESPONSE_LIMIT = 1_048_576
+DIAGNOSTIC_CATEGORIES = {
+    "DNS_FAILURE", "TLS_FAILURE", "CONNECT_TIMEOUT", "READ_TIMEOUT", "HTTP_STATUS",
+    "PROXY_ERROR", "CONNECTION_ERROR", "RESPONSE_FORMAT_ERROR", "UNKNOWN_NETWORK_ERROR",
+}
+_PROXY_STATUS: bool | None = None
+
+
+def _proxy_configured(proxies: dict[str, str] | None = None) -> bool:
+    """Return proxy presence only; never expose an address or credentials."""
+    global _PROXY_STATUS
+    if proxies is None:
+        if _PROXY_STATUS is None:
+            try:
+                _PROXY_STATUS = any(bool(value) for value in urllib.request.getproxies().values())
+            except Exception:
+                _PROXY_STATUS = False
+        return _PROXY_STATUS
+    return any(bool(value) for value in proxies.values())
+
+
+def _diagnostic_category(exc: BaseException) -> str:
+    """Map transport/parser exceptions to fixed categories; never return exception text."""
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            exc.close()
+        except Exception:
+            pass
+        return "HTTP_STATUS"
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, socket.gaierror):
+        return "DNS_FAILURE"
+    if isinstance(reason, ssl.SSLError):
+        return "TLS_FAILURE"
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return "CONNECT_TIMEOUT"
+    if isinstance(reason, str) and "proxy" in reason.casefold():
+        return "PROXY_ERROR"
+    if isinstance(reason, (ConnectionError, ConnectionResetError, ConnectionRefusedError)):
+        if isinstance(exc, urllib.error.URLError) and _proxy_configured():
+            return "PROXY_ERROR"
+        return "CONNECTION_ERROR"
+    if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError, ValueError)):
+        return "RESPONSE_FORMAT_ERROR"
+    if isinstance(exc, OSError):
+        return "CONNECTION_ERROR"
+    return "UNKNOWN_NETWORK_ERROR"
 
 
 def _config_file(config_dir: str | Path | None = None) -> Path | None:
@@ -142,7 +189,9 @@ def _http(path: str, *, token: str | None = None, query: str | None = None,
             or parsed_url.port not in (None, 443) or parsed_url.username or parsed_url.password):
         raise ValueError("request host rejected")
     opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
         urllib.request.HTTPSHandler(context=ssl.create_default_context()), _NoRedirect())
+    _proxy_configured()
     start = time.monotonic()
     try:
         response = opener.open(request, timeout=max(1, min(timeout, 15)))
@@ -166,6 +215,22 @@ def _json(body: bytes):
     if len(body) > RESPONSE_LIMIT:
         raise ValueError("response size exceeded")
     return json.loads(body.decode("utf-8"))
+
+
+def _health_ok(status: int, body: bytes) -> bool:
+    try:
+        payload = _json(body)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return status == 200 and isinstance(payload, dict) and payload.get("status") == "ok"
+
+
+def _anonymous_ok(status: int, body: bytes) -> bool:
+    try:
+        payload = _json(body)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return status == 401 and isinstance(payload, dict) and payload.get("error") == "unauthorized"
 
 
 def _rows(configured: bool, token_present: bool, *, approval_disabled: bool = True) -> list[dict[str, str]]:
@@ -195,14 +260,13 @@ def _rows(configured: bool, token_present: bool, *, approval_disabled: bool = Tr
             add(name, expected, detail, "PASS" if passed else "FAIL")
             return status, body, passed
         except Exception as exc:
-            _ = exc  # Do not serialize exception, URL, headers, or response snippets.
-            add(name, expected, "Request failed; exception details suppressed", "FAIL")
+            category = _diagnostic_category(exc)
+            add(name, expected, "Request failed; diagnostic=" + category, "FAIL")
             return 0, b"", False
 
-    request_case("Public health", "HTTP 200 JSON status=ok", "/healthz",
-                 validate=lambda s, b: s == 200 and _json(b).get("status") == "ok")
+    request_case("Public health", "HTTP 200 JSON status=ok", "/healthz", validate=_health_ok)
     request_case("Anonymous search", "HTTP 401 unauthorized JSON", "/search", query="Python documentation",
-                 validate=lambda s, b: s == 401 and isinstance(_json(b), dict))
+                 validate=_anonymous_ok)
     if not token_present:
         add("Invalid-token search", "HTTP 401", "Token absent; no request sent", "BLOCKED")
         add("Authenticated search", "HTTP 200 JSON", "Token absent; no request sent", "BLOCKED")
@@ -240,9 +304,9 @@ def _rows(configured: bool, token_present: bool, *, approval_disabled: bool = Tr
                     observed = f"HTTP {qstatus}; {len(items) if isinstance(items, list) else 0} results; {elapsed:.2f}s; relevant={'yes' if relevant_match else 'no'}"
                     add("Public query: " + query, "HTTP 200, nonempty relevant HTTPS results", observed,
                         "PASS" if good and relevant_match else "FAIL")
-                except Exception:
+                except Exception as exc:
                     add("Public query: " + query, "HTTP 200, valid nonempty HTTPS results",
-                        "Request or response failed; details suppressed", "FAIL")
+                        "Request or response failed; diagnostic=" + _diagnostic_category(exc), "FAIL")
 
     request_case("Unknown route", "HTTP 404", "/uat-route-that-does-not-exist",
                  validate=lambda s, b: s == 404)
@@ -250,20 +314,24 @@ def _rows(configured: bool, token_present: bool, *, approval_disabled: bool = Tr
                  query="\x00\x01", validate=lambda s, b: 400 <= s < 500)
 
     stability: list[tuple[int, bool, float]] = []
+    stability_diagnostics: list[str] = []
     for query in ("Python documentation", "Wikipedia artificial intelligence", "OpenAI official website"):
         try:
             status, body, elapsed = _http("/search", token=_TOKEN if token_present else None, query=query)
             payload = _json(body)
             schema = isinstance(payload, dict) and isinstance(payload.get("results"), list)
             stability.append((status, schema, elapsed))
-        except Exception:
+        except Exception as exc:
             stability.append((0, False, 0.0))
+            stability_diagnostics.append(_diagnostic_category(exc))
     stable = bool(stability) and all(status not in {0} and status < 500 and schema
                                     for status, schema, _ in stability)
     codes = ",".join(str(status) for status, _, _ in stability)
+    stability_observed = f"Statuses {codes}; valid schemas={'yes' if stable else 'no'}"
+    if stability_diagnostics:
+        stability_observed += "; diagnostics=" + ",".join(stability_diagnostics)
     add("Sequential stability (3 requests)", "No 5xx; valid JSON results schema",
-        f"Statuses {codes}; valid schemas={'yes' if stable else 'no'}",
-        "PASS" if stable else "FAIL")
+        stability_observed, "PASS" if stable else "FAIL")
     return rows
 
 
