@@ -32,19 +32,14 @@ DIAGNOSTIC_CATEGORIES = {
     "DNS_FAILURE", "TLS_FAILURE", "CONNECT_TIMEOUT", "READ_TIMEOUT", "HTTP_STATUS",
     "PROXY_ERROR", "CONNECTION_ERROR", "RESPONSE_FORMAT_ERROR", "UNKNOWN_NETWORK_ERROR",
 }
-_PROXY_STATUS: bool | None = None
-
-
 def _proxy_configured(proxies: dict[str, str] | None = None) -> bool:
     """Return proxy presence only; never expose an address or credentials."""
     global _PROXY_STATUS
     if proxies is None:
-        if _PROXY_STATUS is None:
-            try:
-                _PROXY_STATUS = any(bool(value) for value in urllib.request.getproxies().values())
-            except Exception:
-                _PROXY_STATUS = False
-        return _PROXY_STATUS
+        try:
+            return any(bool(value) for value in urllib.request.getproxies().values())
+        except Exception:
+            return False
     return any(bool(value) for value in proxies.values())
 
 
@@ -188,10 +183,10 @@ def _http(path: str, *, token: str | None = None, query: str | None = None,
     if (parsed_url.scheme != "https" or parsed_url.hostname != "sovereign-brain-search.onrender.com"
             or parsed_url.port not in (None, 443) or parsed_url.username or parsed_url.password):
         raise ValueError("request host rejected")
+    _proxy_configured()
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
         urllib.request.HTTPSHandler(context=ssl.create_default_context()), _NoRedirect())
-    _proxy_configured()
     start = time.monotonic()
     try:
         response = opener.open(request, timeout=max(1, min(timeout, 15)))
