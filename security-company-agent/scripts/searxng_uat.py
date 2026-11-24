@@ -103,6 +103,7 @@ def _json(body: bytes):
 
 
 def _rows(configured: bool, token_present: bool, *, approval_disabled: bool = True) -> list[dict[str, str]]:
+    """Build sanitized test outcomes; every request failure remains an explicit FAIL."""
     rows: list[dict[str, str]] = []
 
     def add(name: str, expected: str, observed: str, result: str) -> None:
@@ -158,8 +159,8 @@ def _rows(configured: bool, token_present: bool, *, approval_disabled: bool = Tr
             add("Authenticated result schema", "JSON object with results array",
                 "Schema valid" if schema_ok else "Schema invalid", "PASS" if schema_ok else "FAIL")
             for query, relevant in QUERIES:
-                qstatus, qbody, elapsed = _http("/search", token=_TOKEN, query=query)
                 try:
+                    qstatus, qbody, elapsed = _http("/search", token=_TOKEN, query=query)
                     data = _json(qbody)
                     items = data.get("results") if isinstance(data, dict) else None
                     good = (qstatus == 200 and isinstance(items, list) and bool(items)
@@ -175,7 +176,7 @@ def _rows(configured: bool, token_present: bool, *, approval_disabled: bool = Tr
                         "PASS" if good and relevant_match else "FAIL")
                 except Exception:
                     add("Public query: " + query, "HTTP 200, valid nonempty HTTPS results",
-                        f"HTTP {qstatus}; invalid response suppressed", "FAIL")
+                        "Request or response failed; details suppressed", "FAIL")
 
     request_case("Unknown route", "HTTP 404", "/uat-route-that-does-not-exist",
                  validate=lambda s, b: s == 404)
@@ -203,6 +204,11 @@ def _rows(configured: bool, token_present: bool, *, approval_disabled: bool = Tr
 _TOKEN: str | None = None
 
 
+def _exit_code(rows: list[dict[str, str]]) -> int:
+    """Succeed only when every required outcome passed; BLOCKED is not success."""
+    return 0 if rows and all(row.get("result") == "PASS" for row in rows) else 1
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live", action="store_true", help="allow bounded read-only HTTPS requests (requires operator confirmation)")
@@ -219,9 +225,14 @@ def main(argv=None) -> int:
     print("SEARXNG_APPROVAL_UNCHANGED: " + ("PASS" if approval_disabled else "BLOCKED"))
     if args.live and not live_allowed:
         print("LIVE_UAT_AUTHORIZATION: BLOCKED (requires configured endpoint/token, approval disabled, and explicit rotation confirmation)")
-    for row in _rows(live_allowed, bool(token), approval_disabled=approval_disabled):
+    rows = _rows(live_allowed, bool(token), approval_disabled=approval_disabled)
+    for row in rows:
         print(f"{row['result']} | {row['test']} | expected: {row['expected']} | observed: {row['observed']}")
-    return 0 if configured and approval_disabled and (live_allowed or not args.live) else 1
+    if not args.live:
+        return 0
+    if not live_allowed:
+        return 1
+    return _exit_code(rows)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):

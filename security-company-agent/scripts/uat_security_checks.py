@@ -190,7 +190,7 @@ def _changed_paths(base_ref: str = "origin/stable") -> tuple[bool, set[str], set
         return False, set(), set()
 
 
-def run_checks() -> list[tuple[str, bool]]:
+def run_checks() -> list[tuple[str, bool | str]]:
     """Read only allowlisted local search settings; never emit their values."""
     values: dict[str, str] = {}
     try:
@@ -231,7 +231,7 @@ def run_checks() -> list[tuple[str, bool]]:
     return [
         ("SCANNER_EXECUTION", scan_ok and changed_ok),
         ("OWNER_CONFIG_READINESS", "BLOCKED" if not env_read or not values.get("SEARXNG_API_TOKEN") else "PASS"),
-        ("OFFLINE_SECURITY_VALIDATION", scan_ok and changed_ok and not new_findings and git_status_ok and ignored_result is not None and ignored_result.returncode == 0),
+        ("OFFLINE_SECURITY_VALIDATION", scan_ok and changed_ok and not new_findings and git_status_ok and ignored_result is not None and ignored_result.returncode == 0 and tracked_result is not None and tracked_result.returncode == 1 and not any(category == "tracked_env_file" for _, category, _ in findings)),
         ("LIVE_UAT", "BLOCKED"),
         ("OWNER_CONFIG_ENDPOINT_PRESENT", "BLOCKED" if not env_read or not values.get("SEARXNG_ENDPOINT") else "PASS"),
         ("OWNER_CONFIG_TOKEN_PRESENT", "BLOCKED" if not env_read or not values.get("SEARXNG_API_TOKEN") else "PASS"),
