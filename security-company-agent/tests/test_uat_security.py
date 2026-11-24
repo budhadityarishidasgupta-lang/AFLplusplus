@@ -56,18 +56,50 @@ class UatSecurityTests(unittest.TestCase):
         rows = uat._rows(False, False)
         self.assertEqual(len(rows), 8)
         self.assertTrue(all(row["result"] == "BLOCKED" for row in rows))
+        self.assertEqual(uat._exit_code(rows), 1)
         with patch.object(uat, "_load_search_config", return_value=(None, None, None)):
             with patch("builtins.print") as output:
-                self.assertEqual(uat.main([]), 1)
+                self.assertEqual(uat.main([]), 0)
         lines = [str(call.args[0]) for call in output.call_args_list]
         self.assertIn("UAT_PREFLIGHT: BLOCKED", lines)
         self.assertIn("SEARXNG_APPROVAL_UNCHANGED: BLOCKED", lines)
+        self.assertFalse(any("https://sovereign-brain-search.onrender.com" in str(call) for call in output.call_args_list))
         self.assertTrue(all(row["result"] == "BLOCKED" for row in uat._rows(True, True, approval_disabled=False)))
+
+    def test_live_result_exit_code_requires_every_required_test_to_pass(self):
+        passing = [{"test": "required", "result": "PASS"}]
+        failing = [{"test": "required", "result": "FAIL"}]
+        blocked = [{"test": "required", "result": "BLOCKED"}]
+        self.assertEqual(uat._exit_code(passing), 0)
+        self.assertNotEqual(uat._exit_code([{**passing[0], "result": "PASS"}, failing[0]]), 0)
+        self.assertNotEqual(uat._exit_code(failing), 0)
+        self.assertNotEqual(uat._exit_code(blocked), 0)
+        self.assertNotEqual(uat._exit_code([]), 0)
 
     def test_no_provider_modules_or_provider_secrets_are_referenced(self):
         source = (ROOT / "scripts" / "searxng_uat.py").read_text(encoding="utf-8")
         for forbidden in ("brain_core", "DASH" + "SCOPE_API_KEY", "OPENAI_" + "API_KEY", "BRAVE_API_KEY"):
             self.assertNotIn(forbidden, source)
+
+    def test_all_required_live_tests_passing_returns_zero_without_network(self):
+        rows = [{"test": f"required-{index}", "expected": "PASS", "observed": "PASS", "result": "PASS"} for index in range(14)]
+        with patch.object(uat, "_load_search_config", return_value=(
+            "https://sovereign-brain-search.onrender.com/search", "synthetic-token-only", "0"
+        )), patch.object(uat, "_rows", return_value=rows), patch.object(uat, "_http") as http:
+            self.assertEqual(uat.main(["--live", "--credential-rotation-confirmed"]), 0)
+        http.assert_not_called()
+
+    def test_live_network_exception_is_sanitized_and_required_failure_exits_nonzero(self):
+        secret_marker = "synthetic-network-secret-marker"
+        with patch.object(uat, "_http", side_effect=RuntimeError(secret_marker)), patch("builtins.print") as output:
+            endpoint, token, approval = "https://sovereign-brain-search.onrender.com/search", "synthetic-token-only", "0"
+            with patch.object(uat, "_load_search_config", return_value=(endpoint, token, approval)):
+                code = uat.main(["--live", "--credential-rotation-confirmed"])
+        rendered = " ".join(str(call.args[0]) for call in output.call_args_list)
+        self.assertNotEqual(code, 0)
+        self.assertNotIn(secret_marker, rendered)
+        self.assertNotIn(token, rendered)
+        self.assertIn("Request failed; exception details suppressed", rendered)
 
     def test_http_errors_are_returned_without_exception_body(self):
         import urllib.error
