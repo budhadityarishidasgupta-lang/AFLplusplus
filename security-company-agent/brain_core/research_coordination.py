@@ -9,7 +9,7 @@ import tempfile
 from .fallback_state import FallbackState
 from .provider_selection import ProviderSelection, SelectionReason
 from .providers import ProviderID
-from .web_search import search as brave_search
+from .web_search import search as default_search
 
 
 @dataclass(frozen=True)
@@ -101,7 +101,7 @@ class ResearchCoordinator:
         if not isinstance(authorization_ledger, ResearchAuthorizationLedger):
             raise TypeError('authorization_ledger must be a shared ResearchAuthorizationLedger')
         self._reasoning_runner = reasoning_runner
-        self._search_runner = search_runner or brave_search
+        self._search_runner = search_runner or default_search
         self._authorization_ledger = authorization_ledger
 
     @staticmethod
@@ -176,21 +176,26 @@ class ResearchCoordinator:
             else:
                 try:
                     runner = search_runner or self._search_runner
-                    if runner is brave_search:
+                    if runner is default_search:
                         result = runner(normalized_query, authorized=True, transport=transport)
                     else:
                         result = runner(normalized_query, authorized=True)
                     if not isinstance(result, dict):
                         raise ValueError('invalid search result')
                     research_status = result.get('status', 'http_error')
+                    if not isinstance(research_status, str):
+                        raise ValueError('invalid search result')
                     if research_status == 'ok':
-                        evidence = tuple(result.get('results', ()))
+                        raw_results = result.get('results', ())
+                        if not isinstance(raw_results, (list, tuple)):
+                            raise ValueError('invalid search result')
+                        evidence = tuple(raw_results)
                         research_diagnostic = None
                     else:
                         evidence = ()
                         research_diagnostic = research_status if research_status in {
-                            'missing_key', 'timeout', 'http_error', 'empty', 'unauthorized',
-                            'invalid_query'} else 'http_error'
+                            'missing_key', 'missing_token', 'not_approved', 'invalid_endpoint',
+                            'timeout', 'http_error', 'empty', 'unauthorized', 'invalid_query'} else 'http_error'
                 except Exception:
                     research_status, evidence, research_diagnostic = (
                         'http_error', (), 'http_error')
