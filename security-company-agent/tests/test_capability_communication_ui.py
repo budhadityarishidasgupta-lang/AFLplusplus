@@ -65,6 +65,7 @@ from brain_core.appraisal import NEUTRAL
 from brain_core.model_api import ModelConfig, ModelError, ModelOutputError
 from brain_core.runtime_guard import available_memory_gib
 from brain_core.decision import emotional_transition
+from brain_core.operating_mode import OperatingMode, permits_scoped_research
 
 REPORT = {str(capability_report)!r}
 DATA = Path({str(tmp_path / "data")!r})
