@@ -11,6 +11,8 @@ from brain_core.fallback_state import FallbackState
 from brain_core.provider_selection import ProviderSelection, SelectionReason
 from brain_core.providers import ProviderID
 from brain_core.research_coordination import ResearchAuthorizationLedger, ResearchCoordinator
+from brain_core.provider_config import ConfigurationError, Provider, build_provider_configuration
+from brain_core.web_search import search as default_search
 
 
 class ResearchCoordinationTests(unittest.TestCase):
@@ -165,6 +167,31 @@ class ResearchCoordinationTests(unittest.TestCase):
 
         reopened_ledger = ResearchAuthorizationLedger(self._ledger_path)
         self.assertFalse(reopened_ledger.claim(**claim))
+
+    def test_production_search_rejects_missing_or_unvalidated_configuration(self):
+        ledger = self._ledger()
+        reasoning = Mock(return_value=FallbackState.SUCCESS)
+        calls = []
+
+        def transport(request, timeout):
+            calls.append(request)
+            raise AssertionError('transport must not be reached')
+
+        coordinator = ResearchCoordinator(reasoning_runner=reasoning, authorization_ledger=ledger)
+        missing = coordinator.run(query='synthetic query', research_authorized=True,
+                                  journey_id='journey-missing-config', authorization_id='auth-missing',
+                                  search_runner=default_search, transport=transport)
+        self.assertEqual(missing.research_status, 'invalid_configuration')
+        invalid = build_provider_configuration(Provider.SEARXNG, {
+            'endpoint': 'https://sovereign-brain-search.onrender.com/search',
+            'api_token': 'synthetic-token', 'approved': '1'})
+        object.__setattr__(invalid, 'validated', False)
+        rejected = coordinator.run(query='synthetic query', research_authorized=True,
+                                  journey_id='journey-invalid-config', authorization_id='auth-invalid',
+                                  search_runner=default_search, search_configuration=invalid,
+                                  transport=transport)
+        self.assertEqual(rejected.research_status, 'invalid_configuration')
+        self.assertEqual(calls, [])
 
     def test_reasoning_lane_runs_without_research_consent(self):
         reasoning = Mock(return_value=FallbackState.SUCCESS)

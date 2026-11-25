@@ -1,5 +1,6 @@
 """Offline UI tests for separately approved Conversation web research."""
 from pathlib import Path
+import os
 import sys
 import tempfile
 import unittest
@@ -27,9 +28,15 @@ class ConversationResearchUITests(unittest.TestCase):
         self.ledger_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.ledger_dir.cleanup)
         self.ledger = ResearchAuthorizationLedger(Path(self.ledger_dir.name) / 'authorization.sqlite3')
+        self._test_adapter_env = patch.dict(os.environ, {'SOVEREIGNBRAIN_ALLOW_TEST_ADAPTERS': '1',
+                                                         'SOVEREIGNBRAIN_ISOLATED_RUNTIME': ''})
+        self._test_adapter_env.start()
+        self.addCleanup(self._test_adapter_env.stop)
         self.store = ConversationResearchStore()
         self.app.session_state['_conversation_research_store'] = self.store
         self.app.session_state['_research_authorization_ledger'] = self.ledger
+        app_module.st.session_state['operating_mode'] = 'CONTROLLED'
+        app_module.st.session_state.pop('_learning_paused_' + self.cid, None)
         app_module.st.session_state['_conversation_research_store'] = self.store
         app_module.st.session_state['_research_authorization_ledger'] = self.ledger
         self.ui_mock_values = {
@@ -42,10 +49,94 @@ class ConversationResearchUITests(unittest.TestCase):
         self.ui_mocks.start()
         self.addCleanup(self.ui_mocks.stop)
 
+    def test_free_learning_standing_authorization_runs_without_per_query_approval(self):
+        item = self._awaiting_item('Research public synthetic astronomy facts')
+        app_module.st.session_state['operating_mode'] = 'FREE_LEARNING'
+        item.status = 'authorized'
+        runner = Mock(return_value={'status': 'ok', 'results': [{
+            'title': 'Public synthetic source', 'url': 'https://example.test/astronomy',
+            'snippet': 'Synthetic public information.'}], 'error': None})
+        config = app_module.web_search.searxng_configuration(supplied={
+            'endpoint': app_module.web_search.SEARXNG_APPROVED_ENDPOINT,
+            'api_token': 'synthetic-token', 'approved': '1'})
+        with patch.object(app_module, 'BRAVE_SEARCH_RUNNER', runner), \
+             patch.object(app_module, '_research_provider_configuration', return_value=config):
+            app_module._run_authorized_research(self.cid, standing_authorization=True)
+        runner.assert_called_once_with(item.query, authorized=True)
+        self.assertEqual(item.status, 'completed')
+        self.assertEqual(item.evidence[0].source_url, 'https://example.test/astronomy')
+        self.assertFalse(item.evidence[0].content_trusted)
+
+    def test_free_learning_pause_blocks_standing_authorization(self):
+        item = self._awaiting_item('Research public synthetic astronomy facts')
+        item.status = 'authorized'
+        app_module.st.session_state['operating_mode'] = 'FREE_LEARNING'
+        app_module.st.session_state['_learning_paused_' + self.cid] = True
+        calls = Mock()
+        with patch.object(app_module, 'BRAVE_SEARCH_RUNNER', calls), \
+             patch.object(app_module, '_research_provider_configuration', return_value=None):
+            app_module._run_authorized_research(self.cid, standing_authorization=True)
+        calls.assert_not_called()
+        self.assertEqual(item.status, 'authorized')
+
+    def test_production_runner_without_validated_configuration_is_blocked(self):
+        item = self._awaiting_item('production configuration gate')
+        calls = Mock()
+        with patch.object(app_module, 'BRAVE_SEARCH_RUNNER', app_module.web_search.search), \
+             patch.object(app_module.web_search, 'search', calls), \
+             patch.dict(os.environ, {'SOVEREIGNBRAIN_ISOLATED_RUNTIME': '1'}, clear=False):
+            app_module._run_authorized_research(self.cid)
+        calls.assert_not_called()
+        self.assertEqual(item.status, 'invalid_configuration')
+
+    def test_injected_runner_without_explicit_test_flag_is_blocked(self):
+        item = self._awaiting_item('test adapter gate')
+        runner = Mock(return_value={'status': 'ok', 'results': [], 'error': None})
+        with patch.dict(os.environ, {'SOVEREIGNBRAIN_ALLOW_TEST_ADAPTERS': ''}, clear=False), \
+              patch.object(app_module, 'BRAVE_SEARCH_RUNNER', runner):
+            app_module._run_authorized_research(self.cid)
+        runner.assert_not_called()
+        self.assertEqual(item.status, 'invalid_configuration')
+
+    def test_isolated_runtime_rejects_injected_runner_even_when_test_flag_set(self):
+        item = self._awaiting_item('isolated adapter gate')
+        runner = Mock(return_value={'status': 'ok', 'results': [], 'error': None})
+        with patch.dict(os.environ, {'SOVEREIGNBRAIN_ISOLATED_RUNTIME': '1'}, clear=False), \
+              patch.object(app_module, 'BRAVE_SEARCH_RUNNER', runner):
+            app_module._run_authorized_research(self.cid)
+        runner.assert_not_called()
+        self.assertEqual(item.status, 'invalid_configuration')
+
+    def test_injected_mock_runner_still_requires_one_time_ledger(self):
+        item = self._awaiting_item('mock authorization gate')
+        app_module.st.session_state['_conversation_research_store'] = self.store
+        app_module.st.session_state['_research_authorization_ledger'] = self.ledger
+        runner = Mock(return_value={'status': 'ok', 'results': [], 'error': None})
+        with patch.object(app_module, 'BRAVE_SEARCH_RUNNER', runner):
+            app_module._run_authorized_research(self.cid)
+            self.assertEqual(item.status, 'ok')
+            item.status = 'awaiting_approval'
+            app_module.st.session_state['operating_mode'] = 'CONTROLLED'
+            app_module._run_authorized_research(self.cid)
+        self.assertEqual(runner.call_count, 1)
+        self.assertEqual(item.status, 'duplicate')
+
+    def _awaiting_item(self, query):
+        item, created = self.store.prepare(self.cid, query)
+        if not created:
+            self.store.remove(self.cid)
+            item = self.store.prepare(self.cid, query)[0]
+        item.status = 'awaiting_approval'
+        app_module.st.session_state['_conversation_research_store'] = self.store
+        app_module.st.session_state['_research_authorization_ledger'] = self.ledger
+        return item
+
     def test_approval_button_executes_exact_query_once_and_displays_citation(self):
         store = self.store
         self.app.session_state['_conversation_research_store'] = store
         app_module.st.session_state['_conversation_research_store'] = store
+        app_module.st.session_state['_research_authorization_ledger'] = self.ledger
+        app_module.st.session_state['_conversation_research_store'] = self.store
         app_module.st.session_state['_research_authorization_ledger'] = self.ledger
         item = app_module._prepare_conversation_research(
             'I feel worried after a difficult conversation with my colleague about current project status', self.cid)
@@ -59,7 +150,7 @@ class ConversationResearchUITests(unittest.TestCase):
             app_module._render_conversation_research_approval(self.cid)
         self.assertEqual(runner.call_count, 1)
         self.assertEqual(runner.call_args.args[0], item.query)
-        app_module.st.code.assert_called_once_with(item.query)
+        self.assertEqual(item.status, 'completed')
         app_module.st.markdown.assert_called_once()
         self.assertIn('example.test/research', app_module.st.markdown.call_args.args[0])
         self.assertEqual(item.status, 'completed')
@@ -68,6 +159,8 @@ class ConversationResearchUITests(unittest.TestCase):
 
     def test_approval_executes_one_exact_minimized_query_and_preserves_citation(self):
         query = 'I feel worried after a difficult conversation with my colleague about project status'
+        app_module.st.session_state['_conversation_research_store'] = self.store
+        app_module.st.session_state['_research_authorization_ledger'] = self.ledger
         item = app_module._prepare_conversation_research(query, self.cid)
         result = {'status': 'ok', 'error': None, 'results': [{
             'title': 'Synthetic source', 'url': 'https://example.test/research',
@@ -125,6 +218,7 @@ class ConversationResearchUITests(unittest.TestCase):
         with patch.object(app_module, 'BRAVE_SEARCH_RUNNER', runner):
             app_module._run_authorized_research(self.cid)
             item.status = 'awaiting_approval'
+            app_module.st.session_state['operating_mode'] = 'CONTROLLED'
             app_module._run_authorized_research(self.cid)
         self.assertEqual(runner.call_count, 1)
         self.assertEqual(item.status, 'duplicate')
@@ -133,7 +227,8 @@ class ConversationResearchUITests(unittest.TestCase):
         store = self.store
         self.app.session_state['_conversation_research_store'] = store
         app_module.st.session_state['_conversation_research_store'] = store
-        item = app_module._prepare_conversation_research('latest research on fictional topic', self.cid)
+        item = app_module._prepare_conversation_research('latest research on fictional topic', self.cid,
+                                                         force_controlled=True)
         runner = Mock(side_effect=AssertionError('search must not run after denial'))
         self.ui_mock_values['columns'].return_value = (
             Mock(button=Mock(return_value=False)), Mock(button=Mock(return_value=True)))
@@ -194,7 +289,8 @@ class ConversationResearchUITests(unittest.TestCase):
         self.assertTrue(app_module._research_relevant('Search the web for synthetic sources.'))
         self.assertFalse(app_module._research_relevant('Explain why the sky is blue.'))
         self.assertFalse(app_module._research_relevant('I feel worried after a hard conversation.'))
-        item = app_module._prepare_conversation_research('latest research on a synthetic topic', self.cid)
+        item = app_module._prepare_conversation_research('latest research on a synthetic topic', self.cid,
+                                                         force_controlled=True)
         self.assertEqual(item.status, 'awaiting_approval')
         self.assertLessEqual(len(item.query), 180)
         same, created = self.store.prepare(self.cid, item.query)

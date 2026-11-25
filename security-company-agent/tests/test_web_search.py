@@ -76,7 +76,11 @@ class WebSearchTests(unittest.TestCase):
         env = dict(self.gateway_env, BRAVE_API_KEY='synthetic-brave-key')
         config = web_search.web_search_configuration(environ=env)
         self.assertEqual(config.provider, 'searxng')
-        self.assertFalse(config.api_key_configured)
+        # Availability of a legacy credential does not cause provider fallback;
+        # it is never copied into the scoped SearXNG configuration.
+        scoped = web_search.searxng_configuration(environ=env)
+        self.assertNotIn('api_key', scoped.as_dict())
+        self.assertEqual(scoped.provider.value, 'searxng')
 
     def test_gateway_success_uses_fixed_host_bearer_token_and_result_limit(self):
         payload = {'results': [

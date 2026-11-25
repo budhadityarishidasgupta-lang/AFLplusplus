@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPOSITORY_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from brain_core.candidate_learning import CandidateLesson
@@ -99,7 +101,8 @@ class CandidateLearningReviewUITests(unittest.TestCase):
         self.mock_values['columns'].return_value = (
             Mock(button=Mock(return_value=False)), Mock(button=Mock(return_value=True)),
             Mock(button=Mock(return_value=False)))
-        app_module._render_candidate_learning_review(self.cid)
+        with patch.object(app_module.st, 'session_state', self.session_state):
+            app_module._render_candidate_learning_review(self.cid)
         self.assertEqual(state['action'], 'modify')
         self.assertFalse(state['text_reviewed'])
 

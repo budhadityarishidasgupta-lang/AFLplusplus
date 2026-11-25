@@ -101,7 +101,7 @@ class ResearchCoordinator:
         if not isinstance(authorization_ledger, ResearchAuthorizationLedger):
             raise TypeError('authorization_ledger must be a shared ResearchAuthorizationLedger')
         self._reasoning_runner = reasoning_runner
-        self._search_runner = search_runner or default_search
+        self._search_runner = default_search if search_runner is None else search_runner
         self._authorization_ledger = authorization_ledger
 
     @staticmethod
@@ -136,8 +136,8 @@ class ResearchCoordinator:
 
     def run(self, *, query, research_authorized=False, authorization_id=None,
             journey_id=None, reasoning_authorized=False, reasoning_selection=None,
-            reasoning_runner=None, search_runner=None, transport=None):
-        """Advance both lanes independently and return sanitized combined state."""
+            reasoning_runner=None, search_runner=None, transport=None, search_configuration=None):
+        """Advance lanes independently; configuration is validated before authorization is spent."""
         query_key, normalized_query = self._query_key(query)
         reasoning_status = FallbackState.FAILED
         selected_provider = next_provider = None
@@ -167,6 +167,18 @@ class ResearchCoordinator:
         elif (not isinstance(journey_id, str) or not journey_id.strip()
               or not isinstance(authorization_id, str) or not authorization_id.strip()):
             research_status, evidence, research_diagnostic = 'invalid_authorization', (), 'invalid_authorization'
+        elif ((self._search_runner if search_runner is None else search_runner) is default_search
+              and search_configuration is None):
+            research_status, evidence, research_diagnostic = 'invalid_configuration', (), 'invalid_configuration'
+        elif (search_configuration is not None and (
+                not getattr(search_configuration, 'configured', False)
+                or not getattr(search_configuration, 'validated', False)
+                or not getattr(search_configuration, 'capability_enabled', False))):
+            research_status = ('not_approved' if getattr(search_configuration, 'configured', False)
+                               and getattr(search_configuration, 'validated', False)
+                               and not getattr(search_configuration, 'capability_enabled', False)
+                               else 'invalid_configuration')
+            evidence, research_diagnostic = (), research_status
         else:
             claimed = self._authorization_ledger.claim(
                 journey_id=journey_id.strip(), authorization_id=authorization_id.strip(),
@@ -175,8 +187,11 @@ class ResearchCoordinator:
                 research_status, evidence, research_diagnostic = 'duplicate', (), 'duplicate_authorization'
             else:
                 try:
-                    runner = search_runner or self._search_runner
-                    if runner is default_search:
+                    runner = self._search_runner if search_runner is None else search_runner
+                    if runner is default_search and search_configuration is not None:
+                        result = runner(normalized_query, authorized=True, transport=transport,
+                                        configuration=search_configuration)
+                    elif runner is default_search:
                         result = runner(normalized_query, authorized=True, transport=transport)
                     else:
                         result = runner(normalized_query, authorized=True)
@@ -195,7 +210,8 @@ class ResearchCoordinator:
                         evidence = ()
                         research_diagnostic = research_status if research_status in {
                             'missing_key', 'missing_token', 'not_approved', 'invalid_endpoint',
-                            'timeout', 'http_error', 'empty', 'unauthorized', 'invalid_query'} else 'http_error'
+                            'timeout', 'http_error', 'empty', 'unauthorized', 'invalid_query',
+                            'invalid_configuration', 'invalid_provider_configuration'} else 'http_error'
                 except Exception:
                     research_status, evidence, research_diagnostic = (
                         'http_error', (), 'http_error')

@@ -23,14 +23,18 @@ class ConversationResearchStore:
     def __init__(self):
         self._items = {}
 
-    def prepare(self, conversation_id, query, *, journey_id=None):
+    def prepare(self, conversation_id, query, *, journey_id=None, standing_authorized=False):
         current = self._items.get(conversation_id)
         normalized = ' '.join(query.split())[:MAX_QUERY_CHARS] if isinstance(query, str) else ''
         if not normalized:
             return None, False
         if current is not None and current.query.casefold() == normalized.casefold():
+            if standing_authorized and current.status == 'awaiting_approval':
+                current.status = 'authorized'
             return current, False
         item = PendingResearch(journey_id or str(uuid.uuid4()), normalized)
+        if standing_authorized:
+            item.status = 'authorized'
         self._items[conversation_id] = item
         return item, True
 
