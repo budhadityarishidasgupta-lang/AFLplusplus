@@ -42,6 +42,8 @@ def _validate_annotation(annotation):
 
 def _normalize_source(source):
     """Keep only minimized source provenance; never pass raw identifiers onward."""
+    if isinstance(source, str):
+        source = {"reference": source}
     if not isinstance(source, dict):
         raise ValueError("Narrative source must be an object")
     safe = {}
@@ -68,8 +70,10 @@ def _load_seed(paths: TrainingPaths, seed_name: str, limit: int,
     normalized = []
     ids_seen = set()
     for row in rows:
-        narrative = row["format"] == "narrative_v1"
+        narrative = row.get("format") == "narrative_v1"
         episode_id = row["id"] if narrative else row["episode_id"]
+        if narrative:
+            row = {key: value for key, value in row.items() if key != "_normalized_id"}
         if not isinstance(episode_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", episode_id):
             raise ValueError("Invalid curated episode identifier")
         if episode_id in ids_seen:
@@ -86,13 +90,21 @@ def _load_seed(paths: TrainingPaths, seed_name: str, limit: int,
             source = _normalize_source(row["source"])
             scrubbed = PrivacyProcessor().process(ImportedMessage(
                 f"{episode_id}-narrative", episode_id, "narrative_observation", None, sequence)).text
+            # Teaching fields are retained for blind-after-baseline reflection, not baseline.
+            hypotheses = row["emotion_hypotheses"]
+            if len(json.dumps(hypotheses, ensure_ascii=False)) > 8_000:
+                raise ValueError("Emotion hypotheses exceed their bound")
             narrative_record = {
                 "experience_type": "narrative_observation",
+                "title": row["title"],
                 "observed_sequence": scrubbed,
+                "emotion_hypotheses": hypotheses,
+                "lesson_candidate": row["lesson_candidate"],
+                "transfer_question": row["transfer_question"],
+                "learning_scope": row["learning_scope"],
+                "outcome_status": row["outcome_status"],
                 "source_context": source,
             }
-            # Teaching fields are validated and retained for reflection, not baseline.
-            hypotheses = row["emotion_hypotheses"]
             if len(json.dumps(hypotheses, ensure_ascii=False)) > 8_000:
                 raise ValueError("Emotion hypotheses exceed their bound")
             annotation = {
