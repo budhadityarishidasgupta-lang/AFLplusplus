@@ -261,12 +261,20 @@ def _analysis_exposure(record: Mapping[str, Any]) -> dict[str, Any]:
     observed = record.get("observed_circumstances", "")
     if not observed and isinstance(narrative, Mapping):
         observed = narrative.get("observed_sequence", "")
+    teaching = (narrative.get("provisional_teaching", {})
+                if isinstance(narrative, Mapping) and record.get("experience_type") == "narrative_observation"
+                else {})
     return {
         "episode_id": record.get("episode_id"),
         "experience_type": record.get("experience_type", "structured_messages"),
         "observed_circumstances": observed,
         "chronological_interaction": record.get("chronological_interaction", []),
-        "narrative_observation": narrative or None,
+        "narrative_observation": {"experience_type": narrative.get("experience_type"),
+                                  "title": narrative.get("title"),
+                                  "observed_sequence": observed,
+                                  "source_context": narrative.get("source_context")}
+            if narrative else None,
+        "provisional_teaching": teaching,
     }
 
 
@@ -889,12 +897,26 @@ def _normalize_annotation(annotation: Mapping[str, Any]) -> dict[str, Any]:
             "generalization": [], "uncertainty": "Teaching annotations are provisional and may be incomplete."}
 
 
+def _with_provisional_teaching(record: Mapping[str, Any], annotation: Mapping[str, Any]) -> dict[str, Any]:
+    """Add teaching material only to the post-baseline reflection request."""
+    enriched = dict(record)
+    if record.get("experience_type") != "narrative_observation":
+        return enriched
+    narrative = dict(enriched.get("narrative_observation") or {})
+    teaching = {key: annotation.get(key) for key in
+                ("inferred_hypotheses", "emotion_hypotheses", "candidate_learning", "lesson_candidate",
+                 "alternatives", "generalization", "transfer_question") if key in annotation}
+    narrative["provisional_teaching"] = teaching
+    enriched["narrative_observation"] = narrative
+    return enriched
+
+
 def reflection_workflow(record: Mapping[str, Any], annotation: Mapping[str, Any], adapter: AnalysisAdapter,
                         *, autonomous_low_risk: bool = False) -> dict[str, Any]:
     """Analyze blind first, then compare with teaching without treating it as ground truth."""
     if autonomous_low_risk and (adapter.provider != "ollama" or not adapter.authorized):
         raise PermissionError("Autonomous lesson handling is restricted to the authorized local runner")
-    independent = validate_analysis(adapter.analyze(record))
+    independent = validate_analysis(adapter.analyze(_with_provisional_teaching(record, annotation)))
     teaching = _normalize_annotation(annotation)
     disagreements = sorted(set(independent["inferred_hypotheses"]) ^ set(teaching["inferred_hypotheses"]))
     missing = sorted(set(teaching["candidate_learning"]) - set(independent["candidate_learning"]))
@@ -1124,7 +1146,8 @@ class TrainingRunner:
 
     @staticmethod
     def _record_for_episode(episode: Episode, batch_id: str, *, lessons: bool = False,
-                            analysis: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                            analysis: Mapping[str, Any] | None = None,
+                            include_teaching: bool = False) -> dict[str, Any]:
         narrative = episode.narrative_experience or {}
         annotation = narrative.get("emotion_hypotheses", [])
         inferred = ([{"hypothesis": _bounded_text(f"{key}: {value}", "emotion hypothesis", 2000), "evidence_refs": []}
@@ -1146,6 +1169,12 @@ class TrainingRunner:
                                  "learning_scope": narrative.get("learning_scope", ""),
                                  "provenance": episode.episode_id}]
                                if lessons and narrative.get("lesson_candidate") else []))
+        if include_teaching and narrative:
+            record["narrative_observation"]["provisional_teaching"] = {
+                "emotion_hypotheses": narrative.get("emotion_hypotheses", []),
+                "lesson_candidate": narrative.get("lesson_candidate", ""),
+                "transfer_question": narrative.get("transfer_question", ""),
+                "learning_scope": narrative.get("learning_scope", "")}
         if analysis:
             record["explicit_emotions"] = [{"emotion": item, "evidence_refs": []}
                                            for item in analysis["explicit_emotions"]]
