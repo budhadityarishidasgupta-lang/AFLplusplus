@@ -5,6 +5,7 @@ import argparse
 import json
 from pathlib import Path
 import re
+from typing import Sequence
 import sys
 
 from brain_core.emotional_learning import (
@@ -55,9 +56,16 @@ def _normalize_source(source):
 
 
 def _load_seed(paths: TrainingPaths, seed_name: str, limit: int,
-               selected_ids: set[str] | None = None):
+               selected_ids: Sequence[str] | set[str] | None = None):
     if not 1 <= limit <= 3:
         raise ValueError("Seed loader limit must be between one and three episodes")
+    if selected_ids is not None:
+        if not selected_ids or any(not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", item) for item in selected_ids):
+            raise ValueError("Requested curated IDs are invalid")
+        if len({item.casefold() for item in selected_ids}) != len(selected_ids):
+            raise ValueError("Duplicate requested curated IDs")
+        if len(selected_ids) > limit:
+            raise ValueError("Requested curated IDs exceed the episode limit")
     if Path(seed_name).name != seed_name or not seed_name.lower().endswith(".jsonl"):
         raise ValueError("Seed must be a JSONL filename directly in private input")
     seed_path = paths.path("input") / seed_name
@@ -70,8 +78,10 @@ def _load_seed(paths: TrainingPaths, seed_name: str, limit: int,
     normalized = []
     ids_seen = set()
     for row in rows:
-        narrative = row.get("format") == "narrative_v1"
-        episode_id = row["id"] if narrative else row["episode_id"]
+        narrative = row.get("format") == "narrative_v1" or "observed_sequence" in row
+        episode_id = row.get("id") if narrative else row.get("episode_id")
+        if not isinstance(episode_id, str):
+            raise ValueError("Curated episode identifier is missing")
         if narrative:
             row = {**row, "episode_id": row["id"], "format": "narrative_v1"}
         if not isinstance(episode_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", episode_id):
@@ -160,9 +170,17 @@ def _load_seed(paths: TrainingPaths, seed_name: str, limit: int,
             annotation = _validate_annotation(row["annotation"])
         normalized.append((episode, annotation))
     if selected_ids is not None:
-        missing = selected_ids - {episode.episode_id for episode, _ in normalized}
+        available = {episode.episode_id for episode, _ in normalized}
+        requested_set = set(selected_ids)
+        missing = requested_set - available
         if missing:
             raise ValueError("Requested curated IDs are missing from the seed")
+        if isinstance(selected_ids, Sequence) and not isinstance(selected_ids, (str, bytes, set, frozenset)):
+            ordered_ids = list(selected_ids)
+        else:
+            ordered_ids = sorted(selected_ids)
+        normalized_by_id = {episode.episode_id: (episode, annotation) for episode, annotation in normalized}
+        normalized = [normalized_by_id[episode_id] for episode_id in ordered_ids]
     selected = normalized[:limit] if selected_ids is None else normalized
     if len(selected) > limit or not selected:
         raise ValueError("Curated selection is empty or exceeds the episode bound")
@@ -176,6 +194,9 @@ def main(argv=None) -> int:
     parser.add_argument("--batch-id", default="p1-synthetic-check")
     parser.add_argument("--seed-file", help="Curated JSONL filename inside private input")
     parser.add_argument("--max-episodes", type=int, default=3)
+    parser.add_argument("--episode-id", action="append", dest="episode_ids",
+                        help="Explicit curated episode ID (repeat for a batch; must exist exactly once)")
+    parser.add_argument("--experience-id", help="Study exactly one curated experience (single-experience mode)")
     parser.add_argument("--timeout", type=float, default=60, help="Per-inference timeout, 1 to 600 seconds")
     parser.add_argument("--authorize-local-pilot", action="store_true",
                         help="Explicitly authorize up to three curated episodes using loopback qwen3:0.6b")
@@ -197,9 +218,16 @@ def main(argv=None) -> int:
             readiness = check_local_readiness()
             if readiness.get("status") != "AVAILABLE":
                 raise RuntimeError(f"Local model readiness failed: {readiness.get('reason')}")
-            selected_ids = {"SB-EM-001", "SB-EM-004", "SB-EM-010"}
+            if args.experience_id and args.episode_ids:
+                raise ValueError("Use --experience-id or --episode-id, not both")
+            selected_ids = ([args.experience_id] if args.experience_id else
+                            args.episode_ids or ["SB-EM-001", "SB-EM-004", "SB-EM-010"])
+            if args.experience_id:
+                args.max_episodes = 1
+            if len({item.casefold() for item in selected_ids}) != len(selected_ids):
+                raise ValueError("Duplicate requested episode IDs")
             episodes, annotations = _load_seed(
-                paths, args.seed_file, args.max_episodes, selected_ids=selected_ids)
+                paths, args.seed_file, args.max_episodes, selected_ids=set(selected_ids))
             with (paths.path("input") / args.seed_file).open(encoding="utf-8") as seed_stream:
                 seed_count = sum(1 for line in seed_stream if line.strip())
             print(f"Seed records loaded: {seed_count}")

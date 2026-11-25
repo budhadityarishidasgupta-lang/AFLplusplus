@@ -1082,6 +1082,8 @@ class TrainingCheckpoint:
     failed_episode_ids: list[str] = field(default_factory=list)
     updated_at: str = field(default_factory=_utc)
     completed_stages: dict[str, list[str]] = field(default_factory=dict)
+    episode_states: dict[str, str] = field(default_factory=dict)
+    _legacy_episode_state_missing: bool = field(default=False, repr=False, compare=False)
 
     def save(self, paths: TrainingPaths) -> Path:
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", self.batch_id):
@@ -1101,8 +1103,15 @@ class TrainingCheckpoint:
         data = json.loads(target.read_text(encoding="utf-8"))
         if data.pop("version", None) != 1:
             raise ValueError("Unsupported checkpoint version")
+        legacy_episode_state_missing = "episode_states" not in data or not data.get("episode_states")
+        data.pop("_legacy_episode_state_missing", None)
         data.setdefault("completed_stages", {})
-        return cls(**data)
+        data.setdefault("episode_states", {})
+        # Version 1 checkpoints predate explicit episode states; retain their stage evidence
+        # and let the runner determine which work is safely resumable.
+        if data.get("phase") == "evaluation_complete" and not data.get("completed_stages", {}).get("batch"):
+            data["phase"] = "training_incomplete"
+        return cls(**data, _legacy_episode_state_missing=legacy_episode_state_missing)
 
 
 class TrainingRunner:
@@ -1121,6 +1130,13 @@ class TrainingRunner:
         if mode != "local" and adapter is not None and adapter.provider != "mock":
             raise ValueError("Dry/synthetic mode excludes genuine providers")
         self.paths, self.mode, self.adapter, self.authorized = paths, mode, adapter, authorized
+
+    @staticmethod
+    def _empty_inference_counts() -> dict[str, dict[str, int]]:
+        return {stage: {"attempted": 0, "responses_received": 0, "validated": 0,
+                        "successful": 0, "failed": 0, "validation_failures": 0}
+                for stage in ("baseline", "independent_analysis", "reflection", "curiosity",
+                              "application_evaluation", "post_training_evaluation")}
 
     @staticmethod
     def _record_for_episode(episode: Episode, batch_id: str, *, lessons: bool = False,
@@ -1188,83 +1204,160 @@ class TrainingRunner:
         if available_memory_gib() is None or available_memory_gib() < policy_for("qwen3:0.6b").minimum_available_gib:
             raise PermissionError("RAM guard unavailable or below the qwen3:0.6b threshold")
         ids = [episode.episode_id for episode in episodes]
+        if not episodes:
+            empty_counts = self._empty_inference_counts()
+            return {"batch_id": batch_id, "mode": "local", "model": "qwen3:0.6b",
+                    "outcome": "NO_TRAINING", "episodes_selected": 0, "episodes_analyzed": 0,
+                    "failed_episodes": [], "skipped_episodes": [], "inference_calls": 0,
+                    "inference_counts": empty_counts, "current_run_inference_counts": empty_counts,
+                    "cumulative_batch_inference_counts": empty_counts, "external_providers": []}
         eligible_ids = [episode.episode_id for episode in episodes
                         if (bool(episode.messages) or
                             isinstance((episode.narrative_experience or {}).get("observed_sequence"), str)
                             and bool(episode.narrative_experience["observed_sequence"].strip()))]
         if len(set(ids)) != len(ids):
             raise ValueError("Pilot episode IDs must be unique")
+        if any(not isinstance(item, str) or not item for item in ids):
+            raise ValueError("Pilot episode IDs must be non-empty text")
         if not ids:
+            empty_counts = self._empty_inference_counts()
             return {"batch_id": batch_id, "mode": "local", "model": "qwen3:0.6b",
                     "outcome": "NO_TRAINING", "episodes_selected": 0, "episodes_analyzed": 0,
                     "failed_episodes": [], "skipped_episodes": [], "inference_calls": 0,
-                    "inference_counts": {}, "external_providers": []}
+                    "inference_counts": empty_counts, "current_run_inference_counts": empty_counts,
+                    "cumulative_batch_inference_counts": empty_counts, "external_providers": []}
+        if not eligible_ids:
+            empty_counts = self._empty_inference_counts()
+            return {"batch_id": batch_id, "mode": "local", "outcome": "NO_TRAINING",
+                    "episodes_selected": len(ids), "episodes_analyzed": 0,
+                    "failed_episodes": [], "skipped_episodes": [
+                        {"episode_id": episode.episode_id,
+                         "reason": "no_eligible_observation" if episode.narrative_experience else "empty_episode"}
+                        for episode in episodes], "inference_calls": 0,
+                    "inference_counts": empty_counts, "current_run_inference_counts": empty_counts,
+                    "cumulative_batch_inference_counts": empty_counts, "external_providers": []}
         self.paths.prepare_layout()
         checkpoint_path = self.paths.path("checkpoints", create_parent=True) / (batch_id + ".json")
         checkpoint = TrainingCheckpoint.load(checkpoint_path, self.paths) if checkpoint_path.exists() else TrainingCheckpoint(batch_id, "baseline")
         if checkpoint.batch_id != batch_id:
             raise ValueError("Checkpoint batch does not match this curated seed batch")
-        if checkpoint_path.exists() and checkpoint.phase == "evaluation_complete" and not checkpoint.completed_stages.get("batch"):
-            # Pre-fix checkpoints overstated completion. Resume this batch rather than trust them.
+        required_episode_stages = {"baseline", "independent_analysis", "reflection", "lesson_handling", "curiosity"}
+        legacy_checkpoint = checkpoint_path.exists() and (
+            checkpoint._legacy_episode_state_missing or
+            (checkpoint.phase == "evaluation_complete" and (
+                not checkpoint.completed_stages.get("batch") or
+                any(required_stage not in checkpoint.completed_stages.get(item, [])
+                    for item in checkpoint.completed_episode_ids for required_stage in required_episode_stages))))
+        # Episode IDs no longer present in the selected batch cannot satisfy its completion state.
+        # Clear untrusted legacy completion claims before deriving the current completed set.
+        if legacy_checkpoint:
             checkpoint.completed_episode_ids = []
             checkpoint.completed_stages = {}
-            checkpoint.phase = "baseline"
+            checkpoint.episode_states = {item: "pending" for item in eligible_ids}
             checkpoint.failed_episode_ids = []
+            checkpoint.phase = "training_incomplete"
             checkpoint.save(self.paths)
-        if any(episode_id not in eligible_ids for episode_id in checkpoint.completed_episode_ids):
-            checkpoint.completed_episode_ids = []
-            checkpoint.completed_stages = {}
-            checkpoint.phase = "baseline"
-            checkpoint.save(self.paths)
-        if not eligible_ids:
-            return {"batch_id": batch_id, "mode": "local", "outcome": "NO_TRAINING",
-                    "episodes_selected": len(ids), "episodes_analyzed": 0, "failed_episodes": [],
-                    "skipped_episodes": [{"episode_id": episode.episode_id,
-                                           "reason": "no_eligible_observation" if episode.narrative_experience else "empty_episode"}
-                                          for episode in episodes],
-                    "inference_calls": 0, "external_providers": [], "checkpoint": str(checkpoint_path)}
-        if not episodes:
-            return {"batch_id": batch_id, "mode": "local", "outcome": "NO_TRAINING",
-                    "episodes_selected": 0, "episodes_analyzed": 0, "failed_episodes": [],
-                    "skipped_episodes": [], "inference_calls": 0,
-                    "external_providers": [], "checkpoint": str(checkpoint_path)}
-        # Old checkpoints counted attempted episodes as completed and cannot safely resume.
+            self.paths.atomic_write(self.paths.path("baseline", create_parent=True) / (batch_id + ".jsonl"), b"")
+            self.paths.atomic_write(self.paths.path("diagnostics", create_parent=True) / (batch_id + ".curiosity.jsonl"), b"")
+            self.paths.atomic_write(self.paths.path("holdout", create_parent=True) / (batch_id + ".jsonl"), b"")
         if any(item not in ids for item in checkpoint.completed_episode_ids):
             checkpoint.completed_episode_ids = [item for item in checkpoint.completed_episode_ids if item in ids]
-        if checkpoint.phase == "evaluation_complete" and set(checkpoint.completed_episode_ids) == set(eligible_ids):
-            holdout_path = self.paths.path("holdout") / (batch_id + ".jsonl")
-            baseline_path = self.paths.path("baseline") / (batch_id + ".jsonl")
-            curiosity_path = self.paths.path("diagnostics") / (batch_id + ".curiosity.jsonl")
-            diagnostic_path = self.paths.path("diagnostics") / (batch_id + ".json")
-            expected_stages = {"baseline", "independent_analysis", "reflection", "lesson_handling", "curiosity"}
-            if (checkpoint.completed_stages.get("batch")
-                    and all(expected_stages.issubset(set(checkpoint.completed_stages.get(item, []))) for item in eligible_ids)
-                    and all(path.is_file() for path in (holdout_path, baseline_path, curiosity_path, diagnostic_path))
-                    and len([line for line in baseline_path.read_text(encoding="utf-8").splitlines() if line.strip()]) == len(eligible_ids)):
-                return {"batch_id": batch_id, "mode": "local", "model": "qwen3:0.6b",
-                        "outcome": "RESUMED_COMPLETE", "episodes_analyzed": len(eligible_ids),
-                        "inference_calls": 0, "external_providers": [], "checkpoint": str(checkpoint_path)}
-        if any(episode_id not in checkpoint.completed_episode_ids for episode_id in eligible_ids):
-            checkpoint.phase = "analysis"
-            checkpoint.completed_stages.pop("batch", None)
-            checkpoint.save(self.paths)
-        elif checkpoint.phase == "evaluation_complete":
-            # A recorded batch phase without its successful stage evidence is not complete.
+        complete_checkpoint = (checkpoint.phase == "evaluation_complete" and not legacy_checkpoint
+                and set(checkpoint.completed_episode_ids) == set(eligible_ids)
+                and checkpoint.completed_stages.get("batch")
+                and all(required_episode_stages.issubset(set(checkpoint.completed_stages.get(item, []))) for item in eligible_ids)
+                and all(checkpoint.episode_states.get(item) in {"evaluation_complete", "consolidated", "quarantined", "lesson_handled"} for item in eligible_ids)
+                and all(item in checkpoint.episode_states for item in eligible_ids))
+        complete_checkpoint = (complete_checkpoint
+            and (self.paths.path("baseline") / (batch_id + ".jsonl")).is_file()
+            and (self.paths.path("holdout") / (batch_id + ".jsonl")).is_file()
+            and (self.paths.path("diagnostics") / (batch_id + ".curiosity.jsonl")).is_file()
+            and (self.paths.path("diagnostics") / (batch_id + ".json")).is_file())
+        if complete_checkpoint:
+            cumulative_counts = self._empty_inference_counts()
+            cumulative_path = self.paths.path("diagnostics", create_parent=True) / (batch_id + ".inference.json")
+            if cumulative_path.exists():
+                try:
+                    stored_counts = json.loads(cumulative_path.read_text(encoding="utf-8"))
+                    for stage, values in stored_counts.items():
+                        if stage in cumulative_counts:
+                            for metric in cumulative_counts[stage]:
+                                cumulative_counts[stage][metric] = int(values.get(metric, 0))
+                except (ValueError, TypeError, OSError):
+                    pass
+            return {"batch_id": batch_id, "mode": "local", "model": "qwen3:0.6b",
+                    "outcome": "RESUMED_COMPLETE", "episodes_analyzed": len(eligible_ids),
+                    "inference_calls": 0, "inference_counts": self._empty_inference_counts(),
+                    "current_run_inference_counts": self._empty_inference_counts(),
+                    "cumulative_batch_inference_counts": cumulative_counts,
+                    "failed_episodes": [], "skipped_episodes": [], "external_providers": [],
+                    "checkpoint": str(checkpoint_path)}
+        was_complete = complete_checkpoint
+        if checkpoint.phase == "evaluation_complete" and not was_complete:
             checkpoint.completed_episode_ids = []
             checkpoint.completed_stages = {}
+            checkpoint.episode_states = {item: "pending" for item in eligible_ids}
             checkpoint.failed_episode_ids = []
-            checkpoint.phase = "baseline"
+            checkpoint.phase = "training_incomplete"
             checkpoint.save(self.paths)
+            baseline_rows = []
+            baseline_by_id = {}
+            self.paths.atomic_write(self.paths.path("baseline", create_parent=True) / (batch_id + ".jsonl"), b"")
+            self.paths.atomic_write(self.paths.path("diagnostics", create_parent=True) / (batch_id + ".curiosity.jsonl"), b"")
+            self.paths.atomic_write(self.paths.path("holdout", create_parent=True) / (batch_id + ".jsonl"), b"")
+        elif was_complete:
+            cumulative_path = self.paths.path("diagnostics", create_parent=True) / (batch_id + ".inference.json")
+            cumulative_counts = self._empty_inference_counts()
+            if cumulative_path.exists():
+                try:
+                    stored_counts = json.loads(cumulative_path.read_text(encoding="utf-8"))
+                    for stage, values in stored_counts.items():
+                        if stage in cumulative_counts:
+                            for metric in cumulative_counts[stage]:
+                                cumulative_counts[stage][metric] = int(values.get(metric, 0))
+                except (ValueError, TypeError, OSError):
+                    pass
+            return {"batch_id": batch_id, "mode": "local", "model": "qwen3:0.6b",
+                    "outcome": "RESUMED_COMPLETE", "episodes_analyzed": len(eligible_ids),
+                    "inference_calls": 0, "inference_counts": self._empty_inference_counts(),
+                    "current_run_inference_counts": self._empty_inference_counts(),
+                    "cumulative_batch_inference_counts": cumulative_counts,
+                    "failed_episodes": [], "skipped_episodes": [], "external_providers": [],
+                    "checkpoint": str(checkpoint_path)}
         completed = set(checkpoint.completed_episode_ids)
+        prior_completed_ids = set(completed)
+        prior_failed_ids = list(checkpoint.failed_episode_ids)
         memory = ExperienceMemory(self.paths)
         baseline_path = self.paths.path("baseline", create_parent=True) / (batch_id + ".jsonl")
+        if legacy_checkpoint:
+            self.paths.atomic_write(baseline_path, b"")
+        baseline_rows = ([json.loads(line) for line in baseline_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+                         if baseline_path.exists() else [])
+        baseline_by_id = {row.get("episode_id"): row for row in baseline_rows}
         baseline = []
-        inference_counts = {stage: {"attempted": 0, "successful": 0, "validation_failures": 0}
-                            for stage in ("baseline", "independent_analysis", "reflection", "curiosity", "post_training_evaluation")}
+        inference_counts = self._empty_inference_counts()
+        cumulative_counts = self._empty_inference_counts()
+        cumulative_path = self.paths.path("diagnostics", create_parent=True) / (batch_id + ".inference.json")
+        if cumulative_path.exists():
+            try:
+                stored_counts = json.loads(cumulative_path.read_text(encoding="utf-8"))
+                for stage, values in stored_counts.items():
+                    if stage in cumulative_counts:
+                        for metric in cumulative_counts[stage]:
+                            cumulative_counts[stage][metric] = int(values.get(metric, 0))
+            except (ValueError, TypeError, OSError):
+                pass
         total_calls_at_start = self.adapter.calls
-        failed_episodes: list[dict[str, str]] = []
+        previous_failed_ids = list(checkpoint.failed_episode_ids)
+        failed_episodes: list[dict[str, str]] = [
+            {"episode_id": episode_id, "reason": "previously_failed_checkpoint"}
+            for episode_id in previous_failed_ids if episode_id not in completed]
+        checkpoint.failed_episode_ids = [item for item in checkpoint.failed_episode_ids
+                                         if item not in eligible_ids or item in completed]
+        for episode_id in eligible_ids:
+            checkpoint.episode_states.setdefault(episode_id, "pending")
         skipped_episodes: list[dict[str, str]] = []
-        print(f"Eligible episodes: {len(episodes)}")
+        print(f"Eligible episodes: {len(eligible_ids)}")
         print("Baseline evaluation started")
         holdout_path = self.paths.path("holdout", create_parent=True) / (batch_id + ".jsonl")
         curiosity_path = self.paths.path("diagnostics", create_parent=True) / (batch_id + ".curiosity.jsonl")
@@ -1274,8 +1367,15 @@ class TrainingRunner:
         candidates = []
         current_episode_failed = False
         for episode_index, episode in enumerate(episodes, 1):
+            if episode.episode_id not in eligible_ids:
+                skipped_episodes.append({"episode_id": episode.episode_id,
+                                         "reason": "no_eligible_observation" if episode.narrative_experience else "empty_episode"})
+                continue
             if episode.episode_id in completed:
                 skipped_episodes.append({"episode_id": episode.episode_id, "reason": "completed_checkpoint_stage"})
+                existing = baseline_by_id.get(episode.episode_id)
+                if existing:
+                    baseline.append(existing)
                 continue
             current_episode_failed = False
             if len(episode.messages) > 80 or any(len(m.get("text", "")) > 12_000 for m in episode.messages):
@@ -1300,19 +1400,29 @@ class TrainingRunner:
                 checkpoint.save(self.paths)
                 continue
             # Baseline is analyzed before this pipeline reads or validates teaching labels.
+            checkpoint.episode_states[episode.episode_id] = "attempted"
             inference_counts["baseline"]["attempted"] += 1
             inference_counts["independent_analysis"]["attempted"] += 1
             try:
-                baseline_result = validate_analysis(self.adapter.analyze(baseline_record))
+                raw_result = self.adapter.analyze(baseline_record)
+                inference_counts["baseline"]["responses_received"] += 1
+                inference_counts["independent_analysis"]["responses_received"] += 1
+                baseline_result = validate_analysis(raw_result)
+                inference_counts["baseline"]["validated"] += 1
+                inference_counts["independent_analysis"]["validated"] += 1
                 inference_counts["baseline"]["successful"] += 1
                 inference_counts["independent_analysis"]["successful"] += 1
+                checkpoint.episode_states[episode.episode_id] = "validated_analysis"
             except Exception as exc:
+                inference_counts["baseline"]["failed"] += 1
+                inference_counts["independent_analysis"]["failed"] += 1
                 inference_counts["baseline"]["validation_failures"] += 1
                 inference_counts["independent_analysis"]["validation_failures"] += 1
-                failed_episodes.append({"episode_id": episode.episode_id, "reason": f"baseline_failed:{type(exc).__name__}"})
-                current_episode_failed = True
+                checkpoint.episode_states[episode.episode_id] = "failed"
                 checkpoint.failed_episode_ids.append(episode.episode_id)
                 checkpoint.save(self.paths)
+                failed_episodes.append({"episode_id": episode.episode_id, "reason": f"baseline_failed:{type(exc).__name__}"})
+                current_episode_failed = True
                 continue
             baseline.append({"episode_id": episode.episode_id, "analysis": baseline_result})
             record = baseline_record
@@ -1320,19 +1430,26 @@ class TrainingRunner:
             print("Baseline evaluation completed")
             inference_counts["reflection"]["attempted"] += 1
             inference_counts["curiosity"]["attempted"] += 1
+            checkpoint.episode_states[episode.episode_id] = "response_received"
             print(f"Analyzing episode {episode_index} of {len(episodes)}: independent emotional interpretation")
             try:
                 reflection = reflection_workflow(record, annotation, self.adapter, autonomous_low_risk=True)
+                inference_counts["reflection"]["responses_received"] += 1
+                inference_counts["reflection"]["validated"] += 1
                 inference_counts["reflection"]["successful"] += 1
+                checkpoint.episode_states[episode.episode_id] = "reflection_completed"
             except Exception as exc:
+                inference_counts["reflection"]["failed"] += 1
                 inference_counts["reflection"]["validation_failures"] += 1
-                failed_episodes.append({"episode_id": episode.episode_id, "reason": f"reflection_failed:{type(exc).__name__}"})
-                current_episode_failed = True
+                checkpoint.episode_states[episode.episode_id] = "failed"
                 checkpoint.failed_episode_ids.append(episode.episode_id)
                 checkpoint.save(self.paths)
+                failed_episodes.append({"episode_id": episode.episode_id, "reason": f"reflection_failed:{type(exc).__name__}"})
+                current_episode_failed = True
                 continue
             print("Reflection completed")
             candidate_lessons = list(reflection["proposed_lesson"])
+            checkpoint.episode_states[episode.episode_id] = "lesson_generated" if candidate_lessons else "validated_analysis"
             narrative = episode.narrative_experience or {}
             print("Candidate lesson generated" if candidate_lessons else "Candidate lesson rejected: independent analysis found no supported lesson")
             evidence_text = _json(_analysis_exposure(record)).casefold()
@@ -1364,13 +1481,20 @@ class TrainingRunner:
                 print("Unsupported lesson interpretation retained with insufficient_evidence status")
             memory.put(lesson)
             lesson_consolidated = False
-            if not quarantine and lesson["candidate_generalized_lessons"]:
+            if quarantine:
+                checkpoint.episode_states[episode.episode_id] = "quarantined"
+            elif not lesson["candidate_generalized_lessons"]:
+                checkpoint.episode_states[episode.episode_id] = "lesson_generated"
+            elif not quarantine and lesson["candidate_generalized_lessons"]:
+                checkpoint.episode_states[episode.episode_id] = "consolidated"
                 memory.set_state(episode.episode_id, "approved", autonomous_training=True,
                                  runner_authorized=self.authorized and self.adapter.authorized)
                 lesson_consolidated = memory.consolidate(episode.episode_id, autonomous_training=True,
                                    runner_authorized=self.authorized and self.adapter.authorized)
                 for lesson_text in grounded:
                     supported.setdefault(lesson_text.casefold(), set()).add(episode.episode_id)
+            inference_counts["curiosity"]["responses_received"] += 1
+            inference_counts["curiosity"]["validated"] += 1
             inference_counts["curiosity"]["successful"] += 1
             curiosity.append({"episode_id": episode.episode_id,
                               "unanswered_question": (blind["missing_evidence"] or ["What additional context could change this interpretation?"])[0],
@@ -1382,23 +1506,42 @@ class TrainingRunner:
                                "candidate_count": len(candidate_lessons), "consolidated": lesson_consolidated})
             checkpoint.completed_episode_ids.append(episode.episode_id)
             completed.add(episode.episode_id)
+            failed_episodes = [item for item in failed_episodes if item["episode_id"] != episode.episode_id]
             checkpoint.completed_stages[episode.episode_id] = ["baseline", "independent_analysis", "reflection", "lesson_handling", "curiosity"]
             checkpoint.completed_stages.pop("batch", None)
-            checkpoint.failed_episode_ids = [item for item in checkpoint.failed_episode_ids if item != episode.episode_id]
             checkpoint.phase = "analysis"
             checkpoint.save(self.paths)
-            self.paths.atomic_write(baseline_path, ("".join(_json(x) + "\n" for x in baseline)).encode())
+            baseline_by_id[episode.episode_id] = baseline[-1]
+            self.paths.atomic_write(baseline_path, ("".join(_json(baseline_by_id[item]) + "\n" for item in ids if item in baseline_by_id)).encode())
             self.paths.atomic_write(curiosity_path, ("".join(_json(x) + "\n" for x in curiosity)).encode())
         print("Curiosity question generated" if curiosity else "Curiosity question skipped: no successfully analyzed episodes")
         for principle, provenance in supported.items():
             evaluations.append({"principle": principle, "supporting_episodes": sorted(provenance),
                                 "consolidated": True, "support_count": len(provenance),
                                 "generalizability": "candidate; only one seed episode supports it"})
+        if failed_episodes and any(item["episode_id"] in prior_failed_ids for item in failed_episodes):
+            failed_episodes = [item for item in failed_episodes
+                               if item["episode_id"] not in prior_failed_ids or
+                               item["reason"] == "previously_failed_checkpoint"]
+        if was_complete and not baseline:
+            outcome = "RESUMED_COMPLETE"
+            return {"batch_id": batch_id, "mode": "local", "model": "qwen3:0.6b",
+                    "outcome": outcome, "episodes_analyzed": len(completed),
+                    "failed_episodes": failed_episodes, "skipped_episodes": skipped_episodes,
+                    "inference_counts": inference_counts, "current_run_inference_counts": inference_counts,
+                    "cumulative_batch_inference_counts": cumulative_counts, "inference_calls": 0,
+                    "external_providers": [], "checkpoint": str(checkpoint_path)}
         if not baseline:
             outcome = "FAILED" if failed_episodes else "NO_TRAINING"
+            for stage, values in inference_counts.items():
+                for metric, count in values.items():
+                    cumulative_counts[stage][metric] += count
+            self.paths.atomic_write(cumulative_path, _json(cumulative_counts).encode())
             return {"batch_id": batch_id, "mode": "local", "model": "qwen3:0.6b",
                     "outcome": outcome, "episodes_analyzed": 0, "failed_episodes": failed_episodes,
                     "skipped_episodes": skipped_episodes, "inference_counts": inference_counts,
+                    "current_run_inference_counts": inference_counts,
+                    "cumulative_batch_inference_counts": cumulative_counts,
                     "inference_calls": self.adapter.calls - total_calls_at_start,
                     "candidate_lessons": 0, "consolidated_lessons": 0, "quarantined_lessons": 0,
                     "external_providers": [], "checkpoint": str(checkpoint_path)}
@@ -1417,22 +1560,37 @@ class TrainingRunner:
                                                  "title": scenario["id"],
                                                  "observed_sequence": scenario["scenario"]})
             probe_record = self._record_for_episode(probe, batch_id)
-            inference_counts["post_training_evaluation"]["attempted"] += 2
+            inference_counts["post_training_evaluation"]["attempted"] += 1
+            inference_counts["application_evaluation"]["attempted"] += 1
             try:
-                without_memory = self.adapter.analyze(probe_record)
+                without_memory = validate_analysis(self.adapter.analyze(probe_record))
+                inference_counts["post_training_evaluation"]["responses_received"] += 1
+                inference_counts["post_training_evaluation"]["validated"] += 1
                 inference_counts["post_training_evaluation"]["successful"] += 1
             except Exception as exc:
+                inference_counts["post_training_evaluation"]["failed"] += 1
+                inference_counts["application_evaluation"]["failed"] += 1
                 inference_counts["post_training_evaluation"]["validation_failures"] += 1
+                inference_counts["application_evaluation"]["validation_failures"] += 1
                 raise RuntimeError(f"Post-training evaluation failed for {scenario['id']}: {type(exc).__name__}") from exc
             retrieved = reloaded_memory.retrieve(scenario["scenario"])
             # Retrieve memory is exposed only in the paired condition; outputs remain comparable.
             retrieval_record = dict(probe_record)
             retrieval_record["observed_circumstances"] += "\nRelevant prior principles: " + _json(
                 [item["candidate_generalized_lessons"] for item in retrieved])
+            inference_counts["post_training_evaluation"]["attempted"] += 1
+            inference_counts["application_evaluation"]["attempted"] += 1
             try:
-                with_memory = self.adapter.analyze(retrieval_record)
+                with_memory = validate_analysis(self.adapter.analyze(retrieval_record))
+                inference_counts["post_training_evaluation"]["responses_received"] += 1
+                inference_counts["post_training_evaluation"]["validated"] += 1
                 inference_counts["post_training_evaluation"]["successful"] += 1
+                inference_counts["application_evaluation"]["responses_received"] += 1
+                inference_counts["application_evaluation"]["validated"] += 1
+                inference_counts["application_evaluation"]["successful"] += 1
             except Exception as exc:
+                inference_counts["post_training_evaluation"]["failed"] += 1
+                inference_counts["application_evaluation"]["failed"] += 1
                 inference_counts["post_training_evaluation"]["validation_failures"] += 1
                 raise RuntimeError(f"Post-training evaluation failed for {scenario['id']}: {type(exc).__name__}") from exc
             holdout_rows.append({"scenario_id": scenario["id"], "without_retrieval": without_memory,
@@ -1440,22 +1598,34 @@ class TrainingRunner:
                                  "principle_application": with_memory.get("generalization", []),
                                  "retrieval_is_not_improvement_evidence": True})
         self.paths.atomic_write(holdout_path, ("".join(_json(x) + "\n" for x in holdout_rows)).encode())
-        if baseline and len(completed) == len(eligible_ids) and not failed_episodes:
+        if was_complete:
+            checkpoint.phase = "evaluation_complete"
+        elif baseline and len(completed) == len(eligible_ids) and not failed_episodes:
             checkpoint.completed_stages["batch"] = ["baseline", "analysis", "reflection", "curiosity", "post_training_evaluation"]
             checkpoint.completed_stages.update({item: ["baseline", "independent_analysis", "reflection", "lesson_handling", "curiosity"] for item in eligible_ids})
             checkpoint.phase = "evaluation_complete"
+            for episode_id in eligible_ids:
+                if checkpoint.episode_states.get(episode_id) not in {"consolidated", "quarantined"}:
+                    checkpoint.episode_states[episode_id] = "lesson_handled"
         else:
             checkpoint.phase = "training_incomplete"
         checkpoint.save(self.paths)
         if checkpoint.phase == "evaluation_complete":
             self.paths.atomic_write(self.paths.path("diagnostics", create_parent=True) / (batch_id + ".json"),
-                                    _json({"batch_id": batch_id, "outcome": "COMPLETED", "evaluation_complete": True}).encode())
-        outcome = ("FAILED" if failed_episodes and not completed else
+                                    _json({"batch_id": batch_id, "outcome": "COMPLETED", "evaluation_complete": True,
+                                           "emotional_learning_complete": True}).encode())
+        outcome = ("RESUMED_COMPLETE" if was_complete else
+                   "FAILED" if failed_episodes and not (completed - prior_completed_ids) else
                    "PARTIAL" if failed_episodes else
                    "COMPLETED" if baseline else "NO_TRAINING")
+        for stage, values in inference_counts.items():
+            for metric, count in values.items():
+                cumulative_counts[stage][metric] += count
+        self.paths.atomic_write(cumulative_path, _json(cumulative_counts).encode())
         return {"batch_id": batch_id, "mode": "local", "model": "qwen3:0.6b",
                 "outcome": outcome, "episodes_analyzed": len(baseline), "failed_episodes": failed_episodes,
                 "skipped_episodes": skipped_episodes, "inference_counts": inference_counts,
+                "current_run_inference_counts": inference_counts, "cumulative_batch_inference_counts": cumulative_counts,
                 "inference_calls": self.adapter.calls - total_calls_at_start,
                 "holdout_scenarios": len(holdout_rows),
                 "candidate_lessons": sum(x["candidate_count"] for x in candidates),

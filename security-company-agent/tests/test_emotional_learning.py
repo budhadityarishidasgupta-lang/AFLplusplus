@@ -283,6 +283,8 @@ def test_seed_jsonl_import_supports_both_structured_and_narrative_schemas():
     parsed = processor.process_seed_jsonl('\n'.join(json.dumps(x) for x in (legacy, narrative)))
     assert parsed[0]['episode_id'] == 'seed-1'
     assert parsed[1]['format'] == 'narrative_v1' and parsed[1]['observed_sequence'] == narrative['observed_sequence']
+    schema_string = {**narrative, 'schema_version': '1.0'}
+    assert processor.process_seed_jsonl(json.dumps(schema_string))[0]['schema_version'] == '1.0'
     with pytest.raises(ValueError): processor.process_seed_jsonl(json.dumps({**narrative, 'schema_version':99}))
 
 
@@ -306,3 +308,18 @@ def test_seed_loader_preserves_narrative_without_inventing_dialogue_or_outcomes(
         assert item['observed_sequence'] in payload and 'outcome_status' in payload
         assert 'timestamp' not in record['narrative_observation']
         assert annotations['SB-EM-001']['observed_outcomes'] == []
+
+
+def test_legacy_structured_seed_without_format_normalizes_in_loader(tmp_path):
+    from sb_t01_train import _load_seed
+    annotation = {"what_happened":"A conversation.","trigger":"A disagreement.","explicit_communication":[],
+                  "explicit_emotions":[],"inferred_hypotheses":[],"alternatives":[],"context":[],
+                  "emotion_behaviour_links":[],"conflicting_needs":[],"observed_outcomes":[],
+                  "missing_evidence":[],"candidate_learning":[],"generalization":[],"uncertainty":"Unknown."}
+    legacy = {'episode_id': 'legacy-1', 'messages': [{'speaker_id': 'speaker_a', 'text': 'A person felt hurt.'}],
+              'annotation': annotation}
+    paths = TrainingPaths(tmp_path)
+    paths.path('input').mkdir()
+    (paths.path('input') / 'legacy.jsonl').write_text(json.dumps(legacy), encoding='utf-8')
+    episodes, _ = _load_seed(paths, 'legacy.jsonl', 1)
+    assert episodes[0].episode_id == 'legacy-1'

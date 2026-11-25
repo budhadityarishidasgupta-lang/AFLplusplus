@@ -76,10 +76,36 @@ def test_selected_seed_ids_and_narrative_normalization(tmp_path):
     paths.path("input").mkdir()
     records = [seed_row(f"SB-EM-{number:03d}") for number in range(1, 12)]
     (paths.path("input") / "seed.jsonl").write_text("\n".join(map(json.dumps, records)), encoding="utf-8")
-    episodes, annotations = _load_seed(paths, "seed.jsonl", 3, {"SB-EM-001", "SB-EM-004", "SB-EM-010"})
+    # Mock must intercept the adapter port actually used by production execution.
+    calls = []
+    episodes, annotations = _load_seed(paths, "seed.jsonl", 3, ["SB-EM-001", "SB-EM-004", "SB-EM-010"])
     assert [episode.episode_id for episode in episodes] == ["SB-EM-001", "SB-EM-004", "SB-EM-010"]
     assert all(episode.narrative_experience["observed_sequence"] for episode in episodes)
     assert set(annotations) == {"SB-EM-001", "SB-EM-004", "SB-EM-010"}
+    assert len(calls) == 0
+    flow_root = tmp_path / "flow"
+    flow_root.mkdir()
+    runner = runner_for(TrainingPaths(flow_root), lambda record: calls.append(record["episode_id"]) or RESULT)
+    report = runner.run_local(episodes[:1], annotations, batch_id="selected-flow", max_episodes=1)
+    assert report["episodes_analyzed"] == 1
+    assert calls[0] == "SB-EM-001"
+    baseline_row = json.loads(Path(report["baseline_artifact"]).read_text(encoding="utf-8").splitlines()[0])
+    assert "lesson_candidate" not in json.dumps(baseline_row["analysis"])
+
+
+def test_episode_id_selection_rejects_missing_invalid_and_duplicate_ids(tmp_path):
+    paths = TrainingPaths(tmp_path)
+    paths.path("input").mkdir()
+    records = [seed_row("SB-EM-001"), seed_row("SB-EM-004")]
+    (paths.path("input") / "seed.jsonl").write_text("\n".join(map(json.dumps, records)), encoding="utf-8")
+    with pytest.raises(ValueError, match="missing"):
+        _load_seed(paths, "seed.jsonl", 1, {"SB-EM-999"})
+    with pytest.raises(ValueError, match="invalid"):
+        _load_seed(paths, "seed.jsonl", 1, {"../bad"})
+    with pytest.raises(ValueError, match="Duplicate"):
+        _load_seed(paths, "seed.jsonl", 2, {"SB-EM-001", "sb-em-001"})
+    with pytest.raises(ValueError, match="episode limit"):
+        _load_seed(paths, "seed.jsonl", 1, {"SB-EM-001", "SB-EM-004"})
 
 
 def test_complete_learning_loop_and_retrieval(tmp_path):
@@ -94,6 +120,12 @@ def test_complete_learning_loop_and_retrieval(tmp_path):
     assert report["inference_counts"]["post_training_evaluation"]["successful"] == 6
     assert report["candidate_lessons"] >= 1
     assert report["candidate_lessons"] == 1
+    assert report["inference_counts"]["baseline"]["attempted"] == 1
+    assert report["inference_counts"]["independent_analysis"]["validated"] == 1
+    assert report["inference_counts"]["reflection"]["attempted"] == 1
+    assert report["inference_counts"]["post_training_evaluation"]["attempted"] == 6
+    assert report["current_run_inference_counts"] == report["inference_counts"]
+    assert report["cumulative_batch_inference_counts"]["baseline"]["successful"] == 1
     assert ExperienceMemory(paths).retrieve("uncertainty") == []
     stored = ExperienceMemory(paths).list_records()
     assert stored and stored[0]["candidate_generalized_lessons"]
@@ -101,8 +133,19 @@ def test_complete_learning_loop_and_retrieval(tmp_path):
     assert checkpoint.completed_stages[episode.episode_id]
     resumed = runner.run_local([episode], {episode.episode_id: RESULT}, batch_id="synthetic-loop", max_episodes=1)
     assert resumed["outcome"] == "RESUMED_COMPLETE"
-    assert resumed["episodes_analyzed"] == 1
-    assert resumed["inference_calls"] == 0
+
+
+def test_resume_counts_are_current_run_and_cumulative_batch(tmp_path):
+    paths = TrainingPaths(tmp_path)
+    episode = make_episode()
+    runner = runner_for(paths, lambda _: RESULT)
+    first = runner.run_local([episode], {episode.episode_id: RESULT}, batch_id="accounting", max_episodes=1)
+    second = runner.run_local([episode], {episode.episode_id: RESULT}, batch_id="accounting", max_episodes=1)
+    assert first["inference_counts"]["baseline"]["successful"] == 1
+    assert second["inference_counts"]["baseline"]["attempted"] == 0
+    assert second["cumulative_batch_inference_counts"]["baseline"]["successful"] == 1
+    assert second["episodes_analyzed"] == 1
+    assert second["inference_calls"] == 0
 
 
 def test_legacy_attempt_checkpoint_is_not_trusted_and_runner_runs(tmp_path):
@@ -122,6 +165,9 @@ def test_legacy_attempt_checkpoint_is_not_trusted_and_runner_runs(tmp_path):
     report = runner.run_local([episode], {"SB-EM-001": RESULT}, batch_id="synthetic-resume", max_episodes=1)
     assert report["outcome"] == "COMPLETED"
     assert report["episodes_analyzed"] == 1
+    checkpoint = TrainingCheckpoint.load(report["checkpoint"], paths)
+    assert checkpoint.episode_states["SB-EM-001"] != "evaluation_complete"
+    assert "SB-EM-001" in checkpoint.completed_episode_ids
 
 
 def test_zero_and_ineligible_episodes_report_no_training(tmp_path):
@@ -134,6 +180,7 @@ def test_zero_and_ineligible_episodes_report_no_training(tmp_path):
     assert report["outcome"] == "NO_TRAINING"
     assert report["episodes_analyzed"] == 0
     assert report["skipped_episodes"] == [{"episode_id": "empty", "reason": "empty_episode"}]
+    assert report["inference_counts"]["baseline"]["attempted"] == 0
 
 
 def test_failed_model_output_is_reported_and_not_checkpointed_complete(tmp_path):
@@ -144,5 +191,44 @@ def test_failed_model_output_is_reported_and_not_checkpointed_complete(tmp_path)
     assert report["episodes_analyzed"] == 0
     assert report["failed_episodes"][0]["reason"].startswith("baseline_failed:")
     assert report["inference_counts"]["baseline"]["validation_failures"] == 1
+    assert report["inference_counts"]["baseline"]["responses_received"] == 1
+    assert report["inference_counts"]["baseline"]["successful"] == 0
     checkpoint = TrainingCheckpoint.load(report["checkpoint"], paths)
     assert checkpoint.completed_episode_ids == []
+    assert checkpoint.episode_states["SB-EM-001"] == "failed"
+    report2 = runner_for(paths, lambda _: RESULT).run_local([make_episode()], {"SB-EM-001": RESULT}, batch_id="bad-output", max_episodes=1)
+    assert report2["outcome"] == "COMPLETED"
+    assert report2["failed_episodes"] == []
+    assert "SB-EM-001" in checkpoint.failed_episode_ids
+
+
+def test_interrupted_execution_resumes_without_discarding_failed_history(tmp_path):
+    paths = TrainingPaths(tmp_path)
+    first = runner_for(paths, lambda _: {"invalid": "output"}, validate=False)
+    episode = make_episode()
+    failed = first.run_local([episode], {episode.episode_id: RESULT}, batch_id="interrupted", max_episodes=1)
+    assert failed["outcome"] == "FAILED"
+    resumed = runner_for(paths, lambda _: RESULT)
+    report = resumed.run_local([episode], {episode.episode_id: RESULT}, batch_id="interrupted", max_episodes=1)
+    assert report["outcome"] == "COMPLETED"
+    assert report["episodes_analyzed"] == 1
+    assert report["failed_episodes"] == []
+    assert report["inference_counts"]["baseline"]["attempted"] == 1
+    checkpoint = TrainingCheckpoint.load(report["checkpoint"], paths)
+    assert episode.episode_id in checkpoint.completed_episode_ids
+
+def test_failed_reflection_is_not_marked_complete_and_is_reported(tmp_path):
+    paths = TrainingPaths(tmp_path)
+    calls = {"count": 0}
+    def callback(record):
+        calls["count"] += 1
+        if record.get("episode_id", "").startswith("probe-"):
+            return RESULT
+        return RESULT if calls["count"] == 1 else {"invalid": "reflection"}
+    runner = runner_for(paths, callback, validate=False)
+    report = runner.run_local([make_episode()], {"SB-EM-001": RESULT}, batch_id="reflection-fail", max_episodes=1)
+    assert report["outcome"] == "FAILED"
+    assert any(item["reason"].startswith("reflection_failed:") for item in report["failed_episodes"])
+    checkpoint = TrainingCheckpoint.load(report["checkpoint"], paths)
+    assert "SB-EM-001" not in checkpoint.completed_episode_ids
+    assert checkpoint.episode_states["SB-EM-001"] == "failed"
