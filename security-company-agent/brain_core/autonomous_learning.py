@@ -335,7 +335,13 @@ class CognitiveLearningCycle:
         self.curriculum = AutonomousCurriculum(memory)
 
     def run_once(self, activity: LearningActivity | None = None) -> dict[str, Any]:
-        activity = activity or self.curriculum.select(resources=self.sources, local_reasoning_available=bool(self.analyzer and self.analyzer.available()))
+        if activity is None:
+            pending = self.memory.resumable_activities()
+            if pending:
+                stored = pending[0]
+                activity = LearningActivity(stored["activity_id"], stored["kind"], stored["topic"], stored["rationale"], stored["question_id"])
+            else:
+                activity = self.curriculum.select(resources=self.sources, local_reasoning_available=bool(self.analyzer and self.analyzer.available()))
         existing = next((item for item in self.memory.resumable_activities() if item["activity_id"] == activity.activity_id), None)
         self.memory.save_activity(activity, "running", existing["checkpoint"] if existing else {"stage": "select"})
         if existing and existing["checkpoint"].get("stage") == "queued_analysis":
