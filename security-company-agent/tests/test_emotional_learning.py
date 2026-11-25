@@ -191,13 +191,14 @@ def test_local_runner_sequential_checkpoint_and_isolated_consolidation(monkeypat
                           [{'speaker_id':'speaker_1','timestamp':None,'text':'I feel hurt but care.',
                             'reactions':[],'edited':False,'has_attachment':False,'attachment_missing':False}], None, None, [])
         report = runner.run_local([episode], {'pilot-1':result}, batch_id='synthetic-pilot', max_episodes=1)
-        assert report['inference_calls'] == 8  # baseline, blind reflection, three paired holdouts
+        assert report['inference_calls'] == 8  # baseline, reflection analysis, and three paired holdouts
         assert report['model'] == 'qwen3:0.6b' and report['consolidated_lessons'] == 1
         assert report['holdout_scenarios'] == 3
         assert Path(report['curiosity_artifact']).exists()
         assert ExperienceMemory(paths).retrieve('assuming motive')
         resumed = runner.run_local([episode], {'pilot-1':result}, batch_id='synthetic-pilot', max_episodes=1)
-        assert resumed['episodes_analyzed'] == 0
+        assert resumed['episodes_analyzed'] == 1
+    assert resumed['outcome'] == 'RESUMED_COMPLETE'
 
 
 def test_runner_local_requires_operator_authorization_and_exact_model():
@@ -296,7 +297,9 @@ def test_seed_loader_preserves_narrative_without_inventing_dialogue_or_outcomes(
                 'learning_scope':'general', 'outcome_status':'not_observed'}
         (paths.path('input')/'seed.jsonl').write_text(json.dumps(item))
         episodes, annotations = _load_seed(paths, 'seed.jsonl', 1, {'SB-EM-001'})
+        assert episodes[0].episode_id == 'SB-EM-001'
         assert episodes[0].narrative_experience['observed_sequence'] == item['observed_sequence']
+        assert episodes[0].narrative_experience['lesson_candidate'] == item['lesson_candidate']
         record = learning_record(episodes[0], batch_id='fixture')
         payload = json.dumps(record)
         assert record['experience_type'] == 'narrative_observation' and record['chronological_interaction'] == []

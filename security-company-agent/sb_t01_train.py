@@ -73,7 +73,7 @@ def _load_seed(paths: TrainingPaths, seed_name: str, limit: int,
         narrative = row.get("format") == "narrative_v1"
         episode_id = row["id"] if narrative else row["episode_id"]
         if narrative:
-            row = {key: value for key, value in row.items() if key != "_normalized_id"}
+            row = {**row, "episode_id": row["id"], "format": "narrative_v1"}
         if not isinstance(episode_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", episode_id):
             raise ValueError("Invalid curated episode identifier")
         if episode_id in ids_seen:
@@ -197,14 +197,20 @@ def main(argv=None) -> int:
             readiness = check_local_readiness()
             if readiness.get("status") != "AVAILABLE":
                 raise RuntimeError(f"Local model readiness failed: {readiness.get('reason')}")
-            episodes, annotations = _load_seed(paths, args.seed_file, args.max_episodes)
+            selected_ids = {"SB-EM-001", "SB-EM-004", "SB-EM-010"}
+            episodes, annotations = _load_seed(
+                paths, args.seed_file, args.max_episodes, selected_ids=selected_ids)
+            with (paths.path("input") / args.seed_file).open(encoding="utf-8") as seed_stream:
+                seed_count = sum(1 for line in seed_stream if line.strip())
+            print(f"Seed records loaded: {seed_count}")
+            print(f"Episodes selected: {len(episodes)} ({', '.join(episode.episode_id for episode in episodes)})")
             adapter = AnalysisAdapter(provider="ollama", endpoint="http://127.0.0.1:11434/v1",
                                       timeout=args.timeout, authorized=args.authorize_local_pilot)
             runner = TrainingRunner(paths, mode="local", adapter=adapter, authorized=True)
             report = runner.run_local(episodes, annotations, batch_id=args.batch_id,
                                       max_episodes=args.max_episodes)
             print(json.dumps(report, ensure_ascii=False, indent=2))
-            return 0
+            return 0 if report.get("outcome") in {"COMPLETED", "RESUMED_COMPLETE"} else 1
         runner = TrainingRunner(paths, mode=args.mode)
         report = {"mode": args.mode, "training_root": str(paths.root),
                   "layout": paths.prepare_layout(), "input_read": False,

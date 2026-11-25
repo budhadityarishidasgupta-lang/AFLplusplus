@@ -257,12 +257,16 @@ def explicit_operator_authorization(authorized: bool) -> None:
 
 def _analysis_exposure(record: Mapping[str, Any]) -> dict[str, Any]:
     """Minimize the independent analysis payload and keep teaching labels blind."""
+    narrative = record.get("narrative_observation") or {}
+    observed = record.get("observed_circumstances", "")
+    if not observed and isinstance(narrative, Mapping):
+        observed = narrative.get("observed_sequence", "")
     return {
         "episode_id": record.get("episode_id"),
         "experience_type": record.get("experience_type", "structured_messages"),
-        "observed_circumstances": record.get("observed_circumstances", ""),
+        "observed_circumstances": observed,
         "chronological_interaction": record.get("chronological_interaction", []),
-        "narrative_observation": record.get("narrative_observation"),
+        "narrative_observation": narrative or None,
     }
 
 
@@ -855,15 +859,45 @@ def validate_analysis(value: Mapping[str, Any]) -> dict[str, Any]:
     return dict(value)
 
 
+def _normalize_annotation(annotation: Mapping[str, Any]) -> dict[str, Any]:
+    """Map legacy/narrative teaching labels to a comparable, explicitly provisional schema."""
+    if isinstance(annotation, Mapping) and set(annotation) == {
+            "what_happened", "trigger", "explicit_communication", "explicit_emotions",
+            "inferred_hypotheses", "alternatives", "context", "emotion_behaviour_links",
+            "conflicting_needs", "observed_outcomes", "missing_evidence", "candidate_learning",
+            "generalization", "uncertainty"}:
+        return validate_analysis(annotation)
+    hypotheses = annotation.get("inferred_hypotheses", annotation.get("emotion_hypotheses", []))
+    if isinstance(hypotheses, Mapping):
+        hypotheses = [f"{key}: {value}" for key, value in hypotheses.items()]
+    if not isinstance(hypotheses, list):
+        hypotheses = [str(hypotheses)] if hypotheses else []
+    lessons = annotation.get("candidate_learning", annotation.get("lesson_candidate", []))
+    if isinstance(lessons, str):
+        lessons = [lessons] if lessons else []
+    if not isinstance(lessons, list):
+        lessons = []
+    alternatives = annotation.get("alternatives", [])
+    if not isinstance(alternatives, list):
+        alternatives = [str(alternatives)] if alternatives else []
+    return {"what_happened": str(annotation.get("what_happened", "")),
+            "trigger": str(annotation.get("trigger", "")), "explicit_communication": [],
+            "explicit_emotions": [], "inferred_hypotheses": [str(item) for item in hypotheses],
+            "alternatives": [str(item) for item in alternatives], "context": [],
+            "emotion_behaviour_links": [], "conflicting_needs": [], "observed_outcomes": [],
+            "missing_evidence": [], "candidate_learning": [str(item) for item in lessons],
+            "generalization": [], "uncertainty": "Teaching annotations are provisional and may be incomplete."}
+
+
 def reflection_workflow(record: Mapping[str, Any], annotation: Mapping[str, Any], adapter: AnalysisAdapter,
                         *, autonomous_low_risk: bool = False) -> dict[str, Any]:
     """Analyze blind first, then compare with teaching without treating it as ground truth."""
     if autonomous_low_risk and (adapter.provider != "ollama" or not adapter.authorized):
         raise PermissionError("Autonomous lesson handling is restricted to the authorized local runner")
-    independent = adapter.analyze(record)
-    validate_analysis(annotation)
-    disagreements = sorted(set(independent["inferred_hypotheses"]) ^ set(annotation["inferred_hypotheses"]))
-    missing = sorted(set(annotation["candidate_learning"]) - set(independent["candidate_learning"]))
+    independent = validate_analysis(adapter.analyze(record))
+    teaching = _normalize_annotation(annotation)
+    disagreements = sorted(set(independent["inferred_hypotheses"]) ^ set(teaching["inferred_hypotheses"]))
+    missing = sorted(set(teaching["candidate_learning"]) - set(independent["candidate_learning"]))
     candidate = {
         "candidate_id": "candidate_" + hashlib.sha256(_json([record["episode_id"], independent, annotation]).encode()).hexdigest()[:20],
         "episode_id": record["episode_id"], "independent_analysis": independent,
@@ -900,7 +934,8 @@ class ExperienceMemory:
     def _connect(self):
         # Every operation revalidates path to detect post-construction junction replacement.
         target = self.paths.path("database", create_parent=True)
-        if target != self.db:
+        expected = self.paths.root / TrainingPaths.NAMES["database"]
+        if target != expected:
             raise ValueError("Database target changed")
         conn = sqlite3.connect(target)
         conn.execute("PRAGMA foreign_keys=ON")
@@ -968,6 +1003,11 @@ class ExperienceMemory:
                        (episode_id, "consolidated", _utc(), "{}"))
             db.commit()
             return True
+
+    def list_records(self) -> list[dict[str, Any]]:
+        with closing(self._connect()) as db:
+            rows = db.execute("SELECT payload FROM experiences ORDER BY rowid DESC").fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     def retrieve(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         words = set(re.findall(r"\w{4,}", query.casefold()))
@@ -1041,6 +1081,7 @@ class TrainingCheckpoint:
     completed_episode_ids: list[str] = field(default_factory=list)
     failed_episode_ids: list[str] = field(default_factory=list)
     updated_at: str = field(default_factory=_utc)
+    completed_stages: dict[str, list[str]] = field(default_factory=dict)
 
     def save(self, paths: TrainingPaths) -> Path:
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", self.batch_id):
@@ -1060,6 +1101,7 @@ class TrainingCheckpoint:
         data = json.loads(target.read_text(encoding="utf-8"))
         if data.pop("version", None) != 1:
             raise ValueError("Unsupported checkpoint version")
+        data.setdefault("completed_stages", {})
         return cls(**data)
 
 
@@ -1085,11 +1127,18 @@ class TrainingRunner:
                             analysis: Mapping[str, Any] | None = None) -> dict[str, Any]:
         narrative = episode.narrative_experience or {}
         annotation = narrative.get("emotion_hypotheses", [])
-        inferred = ([{"hypothesis": _bounded_text(str(item), "emotion hypothesis", 2000), "evidence_refs": []}
+        inferred = ([{"hypothesis": _bounded_text(f"{key}: {value}", "emotion hypothesis", 2000), "evidence_refs": []}
+                     for key, value in annotation.items()]
+                    if lessons and isinstance(annotation, Mapping) else
+                    [{"hypothesis": _bounded_text(str(item), "emotion hypothesis", 2000), "evidence_refs": []}
                      for item in (annotation if isinstance(annotation, list) else [annotation])]
                     if lessons else [])
+        representation_episode = episode
+        if episode.narrative_experience and episode.messages:
+            representation_episode = Episode(episode.episode_id, episode.source_refs, [], episode.start,
+                                             episode.end, episode.candidate_signals, narrative_experience=episode.narrative_experience)
         record = learning_record(
-            episode, batch_id=batch_id, state="candidate_lesson" if lessons else "analyzed",
+            representation_episode, batch_id=batch_id, state="candidate_lesson" if lessons else "analyzed",
             observed_circumstances=narrative.get("observed_sequence", ""),
             inferred_hypotheses=inferred,
             candidate_lessons=([{"principle": narrative.get("lesson_candidate", ""),
@@ -1139,66 +1188,163 @@ class TrainingRunner:
         if available_memory_gib() is None or available_memory_gib() < policy_for("qwen3:0.6b").minimum_available_gib:
             raise PermissionError("RAM guard unavailable or below the qwen3:0.6b threshold")
         ids = [episode.episode_id for episode in episodes]
+        eligible_ids = [episode.episode_id for episode in episodes
+                        if (bool(episode.messages) or
+                            isinstance((episode.narrative_experience or {}).get("observed_sequence"), str)
+                            and bool(episode.narrative_experience["observed_sequence"].strip()))]
         if len(set(ids)) != len(ids):
             raise ValueError("Pilot episode IDs must be unique")
+        if not ids:
+            return {"batch_id": batch_id, "mode": "local", "model": "qwen3:0.6b",
+                    "outcome": "NO_TRAINING", "episodes_selected": 0, "episodes_analyzed": 0,
+                    "failed_episodes": [], "skipped_episodes": [], "inference_calls": 0,
+                    "inference_counts": {}, "external_providers": []}
         self.paths.prepare_layout()
         checkpoint_path = self.paths.path("checkpoints", create_parent=True) / (batch_id + ".json")
         checkpoint = TrainingCheckpoint.load(checkpoint_path, self.paths) if checkpoint_path.exists() else TrainingCheckpoint(batch_id, "baseline")
-        if checkpoint.batch_id != batch_id or not set(checkpoint.completed_episode_ids).issubset(ids):
-            raise ValueError("Checkpoint batch/episode IDs do not match this curated seed batch")
-        if checkpoint.phase == "evaluation_complete" and set(checkpoint.completed_episode_ids) == set(ids):
+        if checkpoint.batch_id != batch_id:
+            raise ValueError("Checkpoint batch does not match this curated seed batch")
+        if checkpoint_path.exists() and checkpoint.phase == "evaluation_complete" and not checkpoint.completed_stages.get("batch"):
+            # Pre-fix checkpoints overstated completion. Resume this batch rather than trust them.
+            checkpoint.completed_episode_ids = []
+            checkpoint.completed_stages = {}
+            checkpoint.phase = "baseline"
+            checkpoint.failed_episode_ids = []
+            checkpoint.save(self.paths)
+        if any(episode_id not in eligible_ids for episode_id in checkpoint.completed_episode_ids):
+            checkpoint.completed_episode_ids = []
+            checkpoint.completed_stages = {}
+            checkpoint.phase = "baseline"
+            checkpoint.save(self.paths)
+        if not eligible_ids:
+            return {"batch_id": batch_id, "mode": "local", "outcome": "NO_TRAINING",
+                    "episodes_selected": len(ids), "episodes_analyzed": 0, "failed_episodes": [],
+                    "skipped_episodes": [{"episode_id": episode.episode_id,
+                                           "reason": "no_eligible_observation" if episode.narrative_experience else "empty_episode"}
+                                          for episode in episodes],
+                    "inference_calls": 0, "external_providers": [], "checkpoint": str(checkpoint_path)}
+        if not episodes:
+            return {"batch_id": batch_id, "mode": "local", "outcome": "NO_TRAINING",
+                    "episodes_selected": 0, "episodes_analyzed": 0, "failed_episodes": [],
+                    "skipped_episodes": [], "inference_calls": 0,
+                    "external_providers": [], "checkpoint": str(checkpoint_path)}
+        # Old checkpoints counted attempted episodes as completed and cannot safely resume.
+        if any(item not in ids for item in checkpoint.completed_episode_ids):
+            checkpoint.completed_episode_ids = [item for item in checkpoint.completed_episode_ids if item in ids]
+        if checkpoint.phase == "evaluation_complete" and set(checkpoint.completed_episode_ids) == set(eligible_ids):
             holdout_path = self.paths.path("holdout") / (batch_id + ".jsonl")
-            curiosity_path = self.paths.path("diagnostics") / (batch_id + ".curiosity.jsonl")
             baseline_path = self.paths.path("baseline") / (batch_id + ".jsonl")
-            retained = ExperienceMemory(TrainingPaths(self.paths.root)).retrieve("emotional boundary uncertainty")
-            return {"batch_id": batch_id, "mode": "local", "model": "qwen3:0.6b",
-                    "episodes_analyzed": 0, "inference_calls": 0, "candidate_lessons": 0,
-                    "holdout_scenarios": sum(1 for _ in holdout_path.open(encoding="utf-8")) if holdout_path.exists() else 0,
-                    "consolidated_lessons": 0, "quarantined_lessons": 0,
-                    "external_providers": [], "checkpoint": str(checkpoint_path),
-                    "baseline_artifact": str(baseline_path), "holdout_artifact": str(holdout_path),
-                    "curiosity_artifact": str(curiosity_path), "retained_principles": len(retained),
-                    "production_memory_modified": False,
-                    "retention_evaluation": {"kind": "persistent_reload_and_paired_application",
-                                             "memory_reloaded_from_sqlite": True,
-                                             "measured_improvement": False}}
+            curiosity_path = self.paths.path("diagnostics") / (batch_id + ".curiosity.jsonl")
+            diagnostic_path = self.paths.path("diagnostics") / (batch_id + ".json")
+            expected_stages = {"baseline", "independent_analysis", "reflection", "lesson_handling", "curiosity"}
+            if (checkpoint.completed_stages.get("batch")
+                    and all(expected_stages.issubset(set(checkpoint.completed_stages.get(item, []))) for item in eligible_ids)
+                    and all(path.is_file() for path in (holdout_path, baseline_path, curiosity_path, diagnostic_path))
+                    and len([line for line in baseline_path.read_text(encoding="utf-8").splitlines() if line.strip()]) == len(eligible_ids)):
+                return {"batch_id": batch_id, "mode": "local", "model": "qwen3:0.6b",
+                        "outcome": "RESUMED_COMPLETE", "episodes_analyzed": len(eligible_ids),
+                        "inference_calls": 0, "external_providers": [], "checkpoint": str(checkpoint_path)}
+        if any(episode_id not in checkpoint.completed_episode_ids for episode_id in eligible_ids):
+            checkpoint.phase = "analysis"
+            checkpoint.completed_stages.pop("batch", None)
+            checkpoint.save(self.paths)
+        elif checkpoint.phase == "evaluation_complete":
+            # A recorded batch phase without its successful stage evidence is not complete.
+            checkpoint.completed_episode_ids = []
+            checkpoint.completed_stages = {}
+            checkpoint.failed_episode_ids = []
+            checkpoint.phase = "baseline"
+            checkpoint.save(self.paths)
         completed = set(checkpoint.completed_episode_ids)
         memory = ExperienceMemory(self.paths)
         baseline_path = self.paths.path("baseline", create_parent=True) / (batch_id + ".jsonl")
         baseline = []
+        inference_counts = {stage: {"attempted": 0, "successful": 0, "validation_failures": 0}
+                            for stage in ("baseline", "independent_analysis", "reflection", "curiosity", "post_training_evaluation")}
+        total_calls_at_start = self.adapter.calls
+        failed_episodes: list[dict[str, str]] = []
+        skipped_episodes: list[dict[str, str]] = []
+        print(f"Eligible episodes: {len(episodes)}")
+        print("Baseline evaluation started")
         holdout_path = self.paths.path("holdout", create_parent=True) / (batch_id + ".jsonl")
         curiosity_path = self.paths.path("diagnostics", create_parent=True) / (batch_id + ".curiosity.jsonl")
         evaluations = []
         curiosity = []
         supported: dict[str, set[str]] = {}
         candidates = []
-        for episode in episodes:
+        current_episode_failed = False
+        for episode_index, episode in enumerate(episodes, 1):
             if episode.episode_id in completed:
+                skipped_episodes.append({"episode_id": episode.episode_id, "reason": "completed_checkpoint_stage"})
                 continue
+            current_episode_failed = False
             if len(episode.messages) > 80 or any(len(m.get("text", "")) > 12_000 for m in episode.messages):
-                raise ValueError("Pilot episode exceeds its message bounds")
+                failed_episodes.append({"episode_id": episode.episode_id, "reason": "episode_exceeds_input_bounds"})
+                checkpoint.failed_episode_ids.append(episode.episode_id)
+                checkpoint.save(self.paths)
+                continue
+            if episode.narrative_experience:
+                observation = episode.narrative_experience.get("observed_sequence")
+                if (not isinstance(observation, str) or not observation.strip()) and not episode.messages:
+                    skipped_episodes.append({"episode_id": episode.episode_id, "reason": "no_eligible_observation"})
+                    continue
+            elif not episode.messages:
+                skipped_episodes.append({"episode_id": episode.episode_id, "reason": "empty_episode"})
+                continue
+            print(f"Analyzing episode {episode_index} of {len(episodes)}")
             baseline_record = self._record_for_episode(episode, batch_id)
             annotation = annotations.get(episode.episode_id)
             if annotation is None:
-                raise ValueError("Missing provisional annotation")
+                failed_episodes.append({"episode_id": episode.episode_id, "reason": "missing_provisional_annotation"})
+                checkpoint.failed_episode_ids.append(episode.episode_id)
+                checkpoint.save(self.paths)
+                continue
             # Baseline is analyzed before this pipeline reads or validates teaching labels.
-            baseline_result = self.adapter.analyze(baseline_record)
+            inference_counts["baseline"]["attempted"] += 1
+            inference_counts["independent_analysis"]["attempted"] += 1
+            try:
+                baseline_result = validate_analysis(self.adapter.analyze(baseline_record))
+                inference_counts["baseline"]["successful"] += 1
+                inference_counts["independent_analysis"]["successful"] += 1
+            except Exception as exc:
+                inference_counts["baseline"]["validation_failures"] += 1
+                inference_counts["independent_analysis"]["validation_failures"] += 1
+                failed_episodes.append({"episode_id": episode.episode_id, "reason": f"baseline_failed:{type(exc).__name__}"})
+                current_episode_failed = True
+                checkpoint.failed_episode_ids.append(episode.episode_id)
+                checkpoint.save(self.paths)
+                continue
             baseline.append({"episode_id": episode.episode_id, "analysis": baseline_result})
             record = baseline_record
             blind = baseline_result
-            reflection = reflection_workflow(record, annotation, self.adapter, autonomous_low_risk=True)
+            print("Baseline evaluation completed")
+            inference_counts["reflection"]["attempted"] += 1
+            inference_counts["curiosity"]["attempted"] += 1
+            print(f"Analyzing episode {episode_index} of {len(episodes)}: independent emotional interpretation")
+            try:
+                reflection = reflection_workflow(record, annotation, self.adapter, autonomous_low_risk=True)
+                inference_counts["reflection"]["successful"] += 1
+            except Exception as exc:
+                inference_counts["reflection"]["validation_failures"] += 1
+                failed_episodes.append({"episode_id": episode.episode_id, "reason": f"reflection_failed:{type(exc).__name__}"})
+                current_episode_failed = True
+                checkpoint.failed_episode_ids.append(episode.episode_id)
+                checkpoint.save(self.paths)
+                continue
+            print("Reflection completed")
             candidate_lessons = list(reflection["proposed_lesson"])
             narrative = episode.narrative_experience or {}
-            if narrative.get("lesson_candidate"):
-                candidate_lessons.append(narrative["lesson_candidate"])
+            print("Candidate lesson generated" if candidate_lessons else "Candidate lesson rejected: independent analysis found no supported lesson")
             evidence_text = _json(_analysis_exposure(record)).casefold()
             grounded = [lesson for lesson in candidate_lessons
                         if len(set(re.findall(r"\w{4,}", lesson.casefold()))
                                    & set(re.findall(r"\w{4,}", evidence_text))) >= 2]
             uncertainty = blind["uncertainty"].casefold()
             sensitive = bool(re.search(r"(?i)\b(?:suicide|self-harm|abuse|assault|diagnosis|medical|sexual|minor)\b", evidence_text))
-            quarantine = (sensitive or not candidate_lessons or any(term in uncertainty for term in
-                          ("insufficient", "uncertain", "unknown", "unclear", "ambiguous")))
+            uncertainty_supported = not any(term in uncertainty for term in
+                                            ("insufficient", "unknown", "unclear", "ambiguous"))
+            quarantine = (sensitive or not candidate_lessons or not uncertainty_supported
+                          or "uncertain" in uncertainty and "uncertain" not in narrative.get("observed_sequence", "").casefold())
             lesson = self._record_for_episode(episode, batch_id, lessons=True,
                                               analysis=reflection["independent_analysis"])
             lesson["candidate_generalized_lessons"] = [
@@ -1207,17 +1353,25 @@ class TrainingRunner:
                 lesson["candidate_generalized_lessons"] = [
                     {"principle": item, "provenance": episode.episode_id}
                     for item in candidate_lessons]
+            if not lesson["candidate_generalized_lessons"] and narrative.get("lesson_candidate"):
+                candidate_lessons.append(narrative["lesson_candidate"])
+                lesson["candidate_generalized_lessons"] = [{
+                    "principle": narrative["lesson_candidate"], "provenance": episode.episode_id}]
             lesson["validation_state"] = "insufficient_evidence" if quarantine else "unvalidated"
             lesson["consolidation_state"] = "quarantined" if quarantine else "candidate"
             lesson["approval_state"] = "autonomous_low_risk_candidate"
+            if candidate_lessons and not lesson["candidate_generalized_lessons"]:
+                print("Unsupported lesson interpretation retained with insufficient_evidence status")
             memory.put(lesson)
-            if not quarantine and candidate_lessons:
+            lesson_consolidated = False
+            if not quarantine and lesson["candidate_generalized_lessons"]:
                 memory.set_state(episode.episode_id, "approved", autonomous_training=True,
                                  runner_authorized=self.authorized and self.adapter.authorized)
-                memory.consolidate(episode.episode_id, autonomous_training=True,
+                lesson_consolidated = memory.consolidate(episode.episode_id, autonomous_training=True,
                                    runner_authorized=self.authorized and self.adapter.authorized)
                 for lesson_text in grounded:
                     supported.setdefault(lesson_text.casefold(), set()).add(episode.episode_id)
+            inference_counts["curiosity"]["successful"] += 1
             curiosity.append({"episode_id": episode.episode_id,
                               "unanswered_question": (blind["missing_evidence"] or ["What additional context could change this interpretation?"])[0],
                               "concept_to_understand": (blind["candidate_learning"] or ["emotional ambiguity"])[0],
@@ -1225,18 +1379,29 @@ class TrainingRunner:
                               "proposed_activity": "Compare this principle with a distinct, low-risk scenario.",
                               "persisted_namespace": "sb-t01-curiosity"})
             candidates.append({"episode_id": episode.episode_id, "quarantined": quarantine,
-                               "candidate_count": len(reflection["proposed_lesson"])})
+                               "candidate_count": len(candidate_lessons), "consolidated": lesson_consolidated})
             checkpoint.completed_episode_ids.append(episode.episode_id)
             completed.add(episode.episode_id)
+            checkpoint.completed_stages[episode.episode_id] = ["baseline", "independent_analysis", "reflection", "lesson_handling", "curiosity"]
+            checkpoint.completed_stages.pop("batch", None)
+            checkpoint.failed_episode_ids = [item for item in checkpoint.failed_episode_ids if item != episode.episode_id]
             checkpoint.phase = "analysis"
             checkpoint.save(self.paths)
             self.paths.atomic_write(baseline_path, ("".join(_json(x) + "\n" for x in baseline)).encode())
-        # Persist curiosity separately in the private diagnostics namespace.
-        self.paths.atomic_write(curiosity_path, ("".join(_json(x) + "\n" for x in curiosity)).encode())
+            self.paths.atomic_write(curiosity_path, ("".join(_json(x) + "\n" for x in curiosity)).encode())
+        print("Curiosity question generated" if curiosity else "Curiosity question skipped: no successfully analyzed episodes")
         for principle, provenance in supported.items():
             evaluations.append({"principle": principle, "supporting_episodes": sorted(provenance),
                                 "consolidated": True, "support_count": len(provenance),
                                 "generalizability": "candidate; only one seed episode supports it"})
+        if not baseline:
+            outcome = "FAILED" if failed_episodes else "NO_TRAINING"
+            return {"batch_id": batch_id, "mode": "local", "model": "qwen3:0.6b",
+                    "outcome": outcome, "episodes_analyzed": 0, "failed_episodes": failed_episodes,
+                    "skipped_episodes": skipped_episodes, "inference_counts": inference_counts,
+                    "inference_calls": self.adapter.calls - total_calls_at_start,
+                    "candidate_lessons": 0, "consolidated_lessons": 0, "quarantined_lessons": 0,
+                    "external_providers": [], "checkpoint": str(checkpoint_path)}
         # Held-out transfer probes are generated independently of seed narratives and annotations.
         holdout_scenarios = [
             {"id": "holdout-boundary", "scenario": "A colleague declines a social invitation, saying they are tired. No further context or response is known."},
@@ -1245,31 +1410,56 @@ class TrainingRunner:
         ]
         holdout_rows = []
         reloaded_memory = ExperienceMemory(TrainingPaths(self.paths.root))
+        print("Post-training evaluation started")
         for scenario in holdout_scenarios:
             probe = Episode("probe-" + scenario["id"], [], [], None, None, [],
                             narrative_experience={"experience_type": "narrative_observation",
                                                  "title": scenario["id"],
                                                  "observed_sequence": scenario["scenario"]})
             probe_record = self._record_for_episode(probe, batch_id)
-            without_memory = self.adapter.analyze(probe_record)
+            inference_counts["post_training_evaluation"]["attempted"] += 2
+            try:
+                without_memory = self.adapter.analyze(probe_record)
+                inference_counts["post_training_evaluation"]["successful"] += 1
+            except Exception as exc:
+                inference_counts["post_training_evaluation"]["validation_failures"] += 1
+                raise RuntimeError(f"Post-training evaluation failed for {scenario['id']}: {type(exc).__name__}") from exc
             retrieved = reloaded_memory.retrieve(scenario["scenario"])
             # Retrieve memory is exposed only in the paired condition; outputs remain comparable.
             retrieval_record = dict(probe_record)
             retrieval_record["observed_circumstances"] += "\nRelevant prior principles: " + _json(
                 [item["candidate_generalized_lessons"] for item in retrieved])
-            with_memory = self.adapter.analyze(retrieval_record)
+            try:
+                with_memory = self.adapter.analyze(retrieval_record)
+                inference_counts["post_training_evaluation"]["successful"] += 1
+            except Exception as exc:
+                inference_counts["post_training_evaluation"]["validation_failures"] += 1
+                raise RuntimeError(f"Post-training evaluation failed for {scenario['id']}: {type(exc).__name__}") from exc
             holdout_rows.append({"scenario_id": scenario["id"], "without_retrieval": without_memory,
                                  "with_retrieval": with_memory, "retrieved_count": len(retrieved),
-                                 "principle_application": with_memory["generalization"],
+                                 "principle_application": with_memory.get("generalization", []),
                                  "retrieval_is_not_improvement_evidence": True})
         self.paths.atomic_write(holdout_path, ("".join(_json(x) + "\n" for x in holdout_rows)).encode())
-        checkpoint.phase = "evaluation_complete"
+        if baseline and len(completed) == len(eligible_ids) and not failed_episodes:
+            checkpoint.completed_stages["batch"] = ["baseline", "analysis", "reflection", "curiosity", "post_training_evaluation"]
+            checkpoint.completed_stages.update({item: ["baseline", "independent_analysis", "reflection", "lesson_handling", "curiosity"] for item in eligible_ids})
+            checkpoint.phase = "evaluation_complete"
+        else:
+            checkpoint.phase = "training_incomplete"
         checkpoint.save(self.paths)
+        if checkpoint.phase == "evaluation_complete":
+            self.paths.atomic_write(self.paths.path("diagnostics", create_parent=True) / (batch_id + ".json"),
+                                    _json({"batch_id": batch_id, "outcome": "COMPLETED", "evaluation_complete": True}).encode())
+        outcome = ("FAILED" if failed_episodes and not completed else
+                   "PARTIAL" if failed_episodes else
+                   "COMPLETED" if baseline else "NO_TRAINING")
         return {"batch_id": batch_id, "mode": "local", "model": "qwen3:0.6b",
-                "episodes_analyzed": len(baseline), "inference_calls": self.adapter.calls,
+                "outcome": outcome, "episodes_analyzed": len(baseline), "failed_episodes": failed_episodes,
+                "skipped_episodes": skipped_episodes, "inference_counts": inference_counts,
+                "inference_calls": self.adapter.calls - total_calls_at_start,
                 "holdout_scenarios": len(holdout_rows),
                 "candidate_lessons": sum(x["candidate_count"] for x in candidates),
-                "consolidated_lessons": sum(not x["quarantined"] and x["candidate_count"] > 0 for x in candidates),
+                "consolidated_lessons": sum(x["consolidated"] for x in candidates),
                 "quarantined_lessons": sum(x["quarantined"] for x in candidates),
                 "candidates": candidates, "external_providers": [], "baseline_artifact": str(baseline_path),
                 "holdout_artifact": str(holdout_path), "curiosity_artifact": str(curiosity_path),
