@@ -160,3 +160,14 @@ def test_queued_analysis_recovers_after_inference_becomes_available(memory):
     resumed = LearningWorker(cycle).run(cycles=1)[0]
     assert resumed["status"] == "completed"
     assert len(source.activities) == 1  # recovered analysis reuses checkpointed evidence
+
+
+def test_direct_cycle_resumes_interrupted_checkpoint(memory):
+    source = SyntheticSource([Evidence("Recovered source text", "document", "checkpoint-doc")])
+    analyzer = SyntheticAnalyzer(is_available=False)
+    activity = CognitiveLearningCycle(memory, [source], analyzer).curriculum.select(resources=[source])
+    memory.save_activity(activity, "running", {"stage": "acquire"})
+    resumed_cycle = CognitiveLearningCycle(memory, [source], analyzer)
+    result = resumed_cycle.run_once()
+    assert result["activity"]["activity_id"] == activity.activity_id
+    assert result["status"] == "queued_analysis"

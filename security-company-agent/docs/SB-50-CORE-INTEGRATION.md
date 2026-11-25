@@ -57,11 +57,13 @@ Run focused deterministic tests:
 python -m pytest tests/test_autonomous_learning.py -q
 ```
 
+Worker controls for an embedded service: construct `LearningWorker(cycle)`, call `start(cycles=None)` for continuous execution, `pause()` to pause between sequential cycles, `resume()` to continue, `stop()` for graceful shutdown, and `join(timeout)` to wait. The CLI itself supports one, bounded-many, or continuous execution and graceful SIGINT/SIGTERM; interactive pause/resume is exposed through the backend API, not a console command.
+
 ## Known integration dependencies
 
 - Live provider/resource factory and provider usage metadata from SB-50.PROVIDER.
 - Emotional episode/experience interface and checkpoint coordination from SB-T01.P2.1.
 - A privacy-approved shared-memory path/retrieval policy and any migration strategy.
 - Provider/local-model execution class metadata should be supplied by the production analyzer for evaluation attribution.
-- Evaluation harness with external criteria; current `evaluation` payload is recorded, not a claim of measured improvement.
+- Evaluation harness with external criteria; current `evaluation` payload is recorded, not a claim of measured improvement. No model-weight training or subjective consciousness/feelings are claimed.
 - Personality interface integration remains intentionally separate from knowledge consolidation.
