@@ -260,6 +260,15 @@ class LearningMemory:
             value["checkpoint"] = json.loads(value["checkpoint"])
         return values
 
+    def resumable_activities(self) -> list[dict[str, Any]]:
+        """Return queued work and mark a prior interrupted running task resumable."""
+        with self._connect() as db:
+            db.execute("UPDATE learning_activities SET status='queued',updated=? WHERE status='running'", (_now(),))
+            values = [dict(row) for row in db.execute("SELECT * FROM learning_activities WHERE status IN ('queued','paused') ORDER BY created")]
+        for value in values:
+            value["checkpoint"] = json.loads(value["checkpoint"])
+        return values
+
     def log_usage(self, activity_id: str, resource: str, status: str, details: dict[str, Any]) -> None:
         with self._connect() as db:
             db.execute("INSERT INTO learning_usage(activity_id,resource,status,details,created) VALUES(?,?,?,?,?)",
@@ -327,7 +336,14 @@ class CognitiveLearningCycle:
 
     def run_once(self, activity: LearningActivity | None = None) -> dict[str, Any]:
         activity = activity or self.curriculum.select(resources=self.sources, local_reasoning_available=bool(self.analyzer and self.analyzer.available()))
-        self.memory.save_activity(activity, "running", {"stage": "select"})
+        existing = next((item for item in self.memory.resumable_activities() if item["activity_id"] == activity.activity_id), None)
+        self.memory.save_activity(activity, "running", existing["checkpoint"] if existing else {"stage": "select"})
+        if existing and existing["checkpoint"].get("stage") == "queued_analysis":
+            evidence = [Evidence(**item) for item in existing["checkpoint"].get("evidence", [])]
+            if not self.analyzer or not self.analyzer.available():
+                self.memory.save_activity(activity, "queued", existing["checkpoint"])
+                return {"activity": asdict(activity), "status": "queued_analysis", "evidence_count": len(evidence), "analysis": None}
+            return self._analyze(activity, evidence)
         evidence: list[Evidence] = []
         for source in self.sources:
             try:
@@ -340,9 +356,12 @@ class CognitiveLearningCycle:
             except Exception as exc:
                 self.memory.log_usage(activity.activity_id, source.name, "error", {"error": str(exc)[:500]})
         if not self.analyzer or not self.analyzer.available():
-            checkpoint = {"stage": "queued_analysis", "evidence_count": len(evidence), "source_types": [e.source_type for e in evidence]}
+            checkpoint = {"stage": "queued_analysis", "evidence_count": len(evidence), "evidence": [asdict(item) for item in evidence], "source_types": [e.source_type for e in evidence]}
             self.memory.save_activity(activity, "queued", checkpoint)
             return {"activity": asdict(activity), "status": "queued_analysis" if evidence else "ingestion_only", "evidence_count": len(evidence), "analysis": None}
+        return self._analyze(activity, evidence)
+
+    def _analyze(self, activity: LearningActivity, evidence: list[Evidence]) -> dict[str, Any]:
         context = self.memory.knowledge(activity.topic, limit=5)
         analysis = self.analyzer.analyze(activity, evidence, context)
         # Keep acquired claims provisional. Consolidation needs independent supporting evidence.
@@ -392,11 +411,19 @@ class LearningWorker:
     def run(self, cycles: int | None = 1) -> list[dict[str, Any]]:
         results = []
         completed = 0
+        memory = getattr(self.cycle, "memory", None)
+        pending = {item["activity_id"]: item for item in memory.resumable_activities()} if memory else {}
         while not self._stop.is_set() and (cycles is None or completed < cycles):
             if self._pause.is_set():
                 time.sleep(min(self.idle_seconds or 0.05, 0.2))
                 continue
-            result = self.cycle.run_once()
+            if pending:
+                stored = next(iter(pending.values()))
+                activity = LearningActivity(stored["activity_id"], stored["kind"], stored["topic"], stored["rationale"], stored["question_id"])
+                result = self.cycle.run_once(activity)
+                pending.pop(activity.activity_id, None)
+            else:
+                result = self.cycle.run_once()
             self.last_result = result
             results.append(result)
             completed += 1

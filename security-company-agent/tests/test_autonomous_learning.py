@@ -81,6 +81,7 @@ def test_unavailable_inference_continues_ingestion_and_queues_analysis(memory):
     result = cycle.run_once()
     assert result["status"] == "queued_analysis"
     assert memory.pending_activities()[0]["status"] == "queued"
+    assert memory.pending_activities()[0]["checkpoint"]["evidence"][0]["source_id"] == "d1"
     assert source.activities
 
 
@@ -147,3 +148,15 @@ def test_contradiction_generates_curiosity_and_blocks_consolidation(memory):
     kid = memory.add_knowledge("The mechanism is X", provenance={"sources": ["a", "b"]})
     assert not memory.consolidate(kid, support_count=2, contradiction=True)
     assert memory.knowledge()[0]["status"] == "provisional"
+
+
+def test_queued_analysis_recovers_after_inference_becomes_available(memory):
+    source = SyntheticSource([Evidence("A fixture document", "document", "recovery-doc")])
+    analyzer = SyntheticAnalyzer(is_available=False)
+    cycle = CognitiveLearningCycle(memory, [source], analyzer)
+    queued = LearningWorker(cycle).run(cycles=1)[0]
+    assert queued["status"] == "queued_analysis"
+    analyzer.is_available_value = True
+    resumed = LearningWorker(cycle).run(cycles=1)[0]
+    assert resumed["status"] == "completed"
+    assert len(source.activities) == 1  # recovered analysis reuses checkpointed evidence

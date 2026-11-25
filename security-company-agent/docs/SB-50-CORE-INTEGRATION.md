@@ -49,7 +49,7 @@ python scripts/learning_worker.py --status
 python scripts/learning_worker.py --continuous --sources-factory my_integration.sources:build --analyzer-factory my_integration.inference:build
 ```
 
-Default CLI factories are absent, so the worker will only perform the explicit no-resource ingestion-only/checkpoint path. For a useful learning run, inject factories. `LearningWorker` offers `pause()`, `resume()`, and `stop()` for an embedding backend; Ctrl+C/SIGTERM gracefully stop the CLI. Sequential task execution is used. Checkpoints/status are in `brain_core/studio_data/autonomous-learning.sqlite3` unless `--db` overrides it. Interrupted/running activities remain inspectable and eligible for recovery; a future integration runner should resubmit queued checkpoints to its analyzer.
+Default CLI factories are absent, so the worker will only perform the explicit no-resource ingestion-only/checkpoint path. For a useful learning run, inject factories. `LearningWorker` offers `pause()`, `resume()`, and `stop()` for an embedding backend; Ctrl+C/SIGTERM gracefully stop the CLI. Sequential task execution is used. Checkpoints/status are in `brain_core/studio_data/autonomous-learning.sqlite3` unless `--db` overrides it. `resumable_activities()` recovers interrupted `running` items; queued acquired evidence is replayed into an available analyzer without reacquisition.
 
 Run focused deterministic tests:
 
@@ -62,6 +62,6 @@ python -m pytest tests/test_autonomous_learning.py -q
 - Live provider/resource factory and provider usage metadata from SB-50.PROVIDER.
 - Emotional episode/experience interface and checkpoint coordination from SB-T01.P2.1.
 - A privacy-approved shared-memory path/retrieval policy and any migration strategy.
-- A production inference runner that can recover `queued_analysis` checkpoints and record provider/local-model execution class.
+- Provider/local-model execution class metadata should be supplied by the production analyzer for evaluation attribution.
 - Evaluation harness with external criteria; current `evaluation` payload is recorded, not a claim of measured improvement.
 - Personality interface integration remains intentionally separate from knowledge consolidation.
