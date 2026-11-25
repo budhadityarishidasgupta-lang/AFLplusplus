@@ -527,7 +527,9 @@ class PrivacyProcessor:
                 if "format" in item and item["format"] != "narrative_v1":
                     raise ValueError(f"Narrative seed line {line_number} has an unsupported format")
                 episode_id = item.get("id")
-                if item.get("schema_version") != 1:
+                version = item.get("schema_version")
+                if not (type(version) in {int, float} and version == 1
+                        or isinstance(version, str) and version.strip() in {"1", "1.0"}):
                     raise ValueError(f"Narrative seed line {line_number} has an unsupported version")
                 if not isinstance(item.get("source"), (str, dict)) or not isinstance(item.get("emotion_hypotheses"), (dict, list)):
                     raise ValueError(f"Narrative seed line {line_number} has invalid structured fields")
